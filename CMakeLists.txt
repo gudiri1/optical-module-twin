@@ -38,6 +38,12 @@ target_include_directories(omt_sim PUBLIC sim/include)
 target_link_libraries(omt_sim PRIVATE omt_fw)
 target_compile_options(omt_sim PRIVATE -Wall -Wextra -Werror)
 set_target_properties(omt_sim PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+if(WIN32)
+  # Self-contained DLL: statically link the toolchain runtime so Python/ctypes
+  # can load it without libgcc/libstdc++/winpthread on PATH (ctypes does not
+  # resolve transitive dependencies via PATH on Windows).
+  target_link_options(omt_sim PRIVATE -static-libgcc -static-libstdc++ -static)
+endif()
 
 # ---- C unit tests ----
 enable_testing()

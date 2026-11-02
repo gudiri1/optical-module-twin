@@ -9,6 +9,7 @@ from __future__ import annotations
 import ctypes as C
 import os
 import struct
+import sys
 from pathlib import Path
 
 GOLDEN_CAL = 0x1
@@ -19,16 +20,27 @@ class I2cNack(IOError):
     """Module did not acknowledge (reset, boot, or held in ResetL)."""
 
 
+def _lib_filenames() -> tuple[str, ...]:
+    if sys.platform == "win32":
+        return ("libomt_sim.dll", "omt_sim.dll")
+    if sys.platform == "darwin":
+        return ("libomt_sim.dylib",)
+    return ("libomt_sim.so",)
+
+
 def _find_lib() -> Path:
     env = os.environ.get("OMT_SIM_LIB")
     if env:
         return Path(env)
     root = Path(__file__).resolve().parents[2]
-    for cand in (root / "build" / "libomt_sim.so", root / "build-rel" / "libomt_sim.so"):
-        if cand.exists():
-            return cand
-    raise FileNotFoundError("libomt_sim.so not found - run `cmake -B build && cmake --build build` "
-                            "or set OMT_SIM_LIB")
+    names = _lib_filenames()
+    for d in (root / "build", root / "build-rel"):
+        for name in names:
+            cand = d / name
+            if cand.exists():
+                return cand
+    raise FileNotFoundError(
+        f"{names[0]} not found - run `cmake -B build && cmake --build build` or set OMT_SIM_LIB")
 
 
 _lib = None
