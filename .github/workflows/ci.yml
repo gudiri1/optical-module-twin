@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: Apache-2.0
+name: ci
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  build-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - run: pip install -r requirements.txt
+      - name: C unit tests under ASan/UBSan
+        run: |
+          cmake -S . -B build-asan -G Ninja -DOMT_SANITIZE=ON
+          cmake --build build-asan
+          ctest --test-dir build-asan --output-on-failure
+      - name: Build twin and run pytest
+        run: |
+          cmake -S . -B build -G Ninja && cmake --build build
+          pytest -q --junitxml=build/junit.xml
+      - name: Verification report
+        run: cd host && python -m omt report --out ../build/report.html
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verification
+          path: |
+            build/report.html
+            build/junit.xml
+            build/trace.json
+
+  # Manual: needs a Zephyr checkout; pin the CI image tag you trust.
+  zephyr-native-sim:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    # pin to a current zephyrproject-rtos/ci image tag
+    container: ghcr.io/zephyrproject-rtos/ci:v0.28.4
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: omt }
+      - run: |
+          west init -m https://github.com/zephyrproject-rtos/zephyr --mr main zp
+          cd zp && west update --narrow -o=--depth=1 zephyr
+      - run: |
+          cd zp && west build -b native_sim/native/64 ../omt/ports/zephyr \
+            -- -DDTC_OVERLAY_FILE=boards/native_sim.overlay
+          ./build/zephyr/zephyr.exe --stop_at=2 | tee run.log
+          grep -q "host: id 0x18 cmis 5.2" run.log

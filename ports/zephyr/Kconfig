@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+mainmenu "Optical Module Twin firmware"
+
+config OMT_HOST_SELFTEST
+	bool "Run a host-side CMIS bring-up from a thread (no I2C target hardware)"
+	help
+	  native_sim has no I2C target controller; a thread plays the host and
+	  drives the CMIS interface through the same entry points the I2C
+	  target callbacks use on hardware.
+
+config OMT_TICK_MS
+	int "Firmware scheduler tick"
+	default 1
+
+source "Kconfig.zephyr"

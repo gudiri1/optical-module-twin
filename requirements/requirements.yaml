@@ -1,0 +1,98 @@
+# SPDX-License-Identifier: Apache-2.0
+# Firmware requirements for the OMT-400G-DR4 module controller.
+# Every requirement is verified by at least one test tagged
+# @pytest.mark.req("<id>") (or a C unit test listed under `unit`).
+# `tools/trace.py` / the HTML report build the traceability matrix.
+
+- id: REQ-MGMT-001
+  text: The module shall expose a CMIS 5.x paged management memory (lower memory, pages 00h, 01h, 02h, 03h, 10h, 11h, 9Fh) at TWI address 0x50.
+  source: CMIS
+  unit: [test_cmis_mem]
+- id: REQ-MGMT-002
+  text: Read-only bytes shall not be modifiable by the host; illegal writes are counted for diagnostics.
+  source: CMIS
+  unit: [test_cmis_mem]
+- id: REQ-MGMT-003
+  text: Page 00h, 01h and 02h checksums shall always be valid.
+  source: CMIS
+- id: REQ-MGMT-004
+  text: Latched flags shall be clear-on-read, honour the host mask bits and drive IntL and the Interrupt bit (byte 3 bit 0).
+  source: CMIS
+  unit: [test_cmis_mem]
+- id: REQ-MGMT-005
+  text: Multi-byte monitor values shall be updated atomically with respect to the host interface (no torn reads).
+  source: Design
+- id: REQ-MGMT-006
+  text: The user EEPROM (page 03h) shall be persistent; bursts of host writes shall be coalesced to limit flash wear.
+  source: Design
+  unit: [test_cmis_mem]
+- id: REQ-MSM-001
+  text: The module shall implement the CMIS module state machine (LowPwr, PwrUp, Ready, PwrDn, Fault) driven by LPMode, LowPwrRequestSW and LowPwrAllowRequestHW.
+  source: CMIS
+- id: REQ-MSM-002
+  text: ModulePwrUp and DPInit shall complete within the durations advertised in page 01h.
+  source: CMIS
+- id: REQ-DP-001
+  text: The module shall support AppSel 1 (400GBASE-DR4) and AppSel 2 (4x 100GBASE-DR breakout) with per data path state machines.
+  source: CMIS / product
+- id: REQ-DP-002
+  text: Invalid or conflicting configuration requests shall be rejected with the specific ConfigStatus code.
+  source: CMIS
+  unit: [test_core]
+- id: REQ-DP-003
+  text: Per-lane OutputDisableTx shall squelch the optical output of that lane without disturbing other lanes.
+  source: CMIS
+- id: REQ-DDM-001
+  text: DDM accuracy over -5..75 degC case shall be within +/-3 degC (temperature), +/-3 % (Vcc), +/-1 dB (TX and RX power).
+  source: Product spec (tighter than SFF-8472/CMIS)
+- id: REQ-DDM-002
+  text: Thresholds in page 02h shall be consistent with control limits (alarms reachable before protective actions).
+  source: Design review F-002
+- id: REQ-DDM-003
+  text: Alarms shall use hysteresis and shall not latch spuriously during power-up.
+  source: Design review F-001
+  unit: [test_core]
+- id: REQ-TX-001
+  text: Automatic power control shall hold launch power within +/-0.5 dB over temperature.
+  source: Product spec
+- id: REQ-TX-002
+  text: A laser that cannot reach target power at maximum bias (end of life) or reports a driver fault shall be shut down and flagged (TxFault) without affecting other lanes.
+  source: Product spec / eye safety
+- id: REQ-TEC-001
+  text: The TEC loop shall hold the laser at 50 +/- 1 degC over the case temperature range; loss of control shall be reported; laser over-temperature shall shut the transmitter down.
+  source: Product spec
+- id: REQ-DSP-001
+  text: The firmware shall supervise the DSP over MDIO (Clause 45), report pre-FEC BER, SNR and RS(544,514) FEC statistics, and tolerate transient MDIO errors.
+  source: Product spec
+- id: REQ-DSP-002
+  text: A hung DSP shall be detected by heartbeat supervision and recovered by reset; repeated failure shall result in ModuleFault.
+  source: Product spec
+- id: REQ-DSP-003
+  text: Receiver sensitivity at pre-FEC BER 2.4e-4 shall be better than -6 dBm average power.
+  source: Product spec
+- id: REQ-FLT-001
+  text: Module over-temperature and supply brown-out shall result in ModuleFault with a readable fault cause.
+  source: Product spec
+- id: REQ-FLT-002
+  text: All faults and resets shall be recorded in a power-fail-safe non-volatile fault log readable over the debug console.
+  source: Failure analysis
+  unit: [test_core]
+- id: REQ-FLT-003
+  text: A hung controller main loop shall be recovered by the watchdog; the reset reason shall be reported to the host.
+  source: Product spec
+- id: REQ-FW-001
+  text: In-field firmware update shall use CMIS CDB (start, write LPL, complete, run, commit) with A/B images and CRC validation.
+  source: CMIS
+- id: REQ-FW-002
+  text: An image that fails to boot shall be rolled back automatically; an uncommitted image shall not survive a power cycle.
+  source: Product spec
+  unit: [test_core]
+- id: REQ-MFG-001
+  text: Factory calibration shall be performed over the management interface behind a password and stored with CRC; post-calibration DDM accuracy shall reach Cpk >= 1.33.
+  source: Manufacturing
+- id: REQ-ROB-001
+  text: Arbitrary host traffic shall never corrupt static pages, leak locks or reset the controller.
+  source: Robustness
+- id: REQ-INT-001
+  text: Module memory shall decode identically in an independent host implementation (Zephyr CMIS library, PR 123842) where both define the field.
+  source: Interoperability

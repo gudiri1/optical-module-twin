@@ -1,0 +1,13 @@
+Optical Module Twin
+Copyright 2026 Richard Gudino
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+CMIS and SFF are specifications of the OIF and the SNIA SFF TA TWG. This
+project models them from public information for simulation and testing; it
+is not affiliated with or endorsed by those organizations or by any module
+vendor, and byte layouts must be checked against the specifications before
+product use.
+
+tools/gen_vectors.py output (build/vectors) is generated test data and may be
+used under the same license, including in other open-source projects.
