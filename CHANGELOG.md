@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+* Build and run natively on Windows (MinGW): the host `ctypes` binding
+  discovers the platform-correct `libomt_sim` name, and the Windows DLL is
+  statically linked (libgcc/libstdc++/winpthread) so it loads without the
+  toolchain runtime on `PATH`. Verified with `pytest` and `ctest`.
+
 ## 1.0.0 (project release, 2026-11)
 * First public release under Apache-2.0: module firmware 1.0, hardware twin, host tools, DVT/manufacturing suites
 * Conformance vectors (`tools/gen_vectors.py`) and Zephyr cross-check (`tests/zephyr/cmis_xcheck`)

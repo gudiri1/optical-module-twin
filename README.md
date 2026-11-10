@@ -37,6 +37,11 @@ python -m omt report --out ../build/report.html         # full evidence page
 `make all` does build + unit tests + pytest + report. `make asan` repeats the C
 tests under AddressSanitizer/UBSan.
 
+The quick start runs on Linux and on Windows (MinGW): the host `ctypes`
+binding resolves the platform's `libomt_sim` name automatically, and the
+Windows DLL is linked with a static runtime so Python loads it without the
+toolchain on `PATH`. Set `OMT_SIM_LIB` to override the library location.
+
 ## What is in here
 
 | Path | Content |
