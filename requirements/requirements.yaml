@@ -5,7 +5,7 @@
 # `tools/trace.py` / the HTML report build the traceability matrix.
 
 - id: REQ-MGMT-001
-  text: The module shall expose a CMIS 5.x paged management memory (lower memory, pages 00h, 01h, 02h, 03h, 10h, 11h, 9Fh) at TWI address 0x50.
+  text: The module shall expose a CMIS 5.x paged management memory (lower memory, pages 00h, 01h, 02h, 03h, 10h, 11h, 13h, 14h, 9Fh) at TWI address 0x50.
   source: CMIS
   unit: [test_cmis_mem]
 - id: REQ-MGMT-002
@@ -29,6 +29,9 @@
 - id: REQ-MSM-001
   text: The module shall implement the CMIS module state machine (LowPwr, PwrUp, Ready, PwrDn, Fault) driven by LPMode, LowPwrRequestSW and LowPwrAllowRequestHW.
   source: CMIS
+- id: REQ-MSM-003
+  text: The power-up sequence shall switch the laser-driver and DSP rails together and hold the DSP in reset for at least 20 ms after its rail switches on, verified on the oscilloscope.
+  source: Bring-up guide / DSP power sequencing
 - id: REQ-MSM-002
   text: ModulePwrUp and DPInit shall complete within the durations advertised in page 01h.
   source: CMIS
@@ -70,6 +73,34 @@
 - id: REQ-DSP-003
   text: Receiver sensitivity at pre-FEC BER 2.4e-4 shall be better than -6 dBm average power.
   source: Product spec
+- id: REQ-SI-001
+  text: Each of the 8 host-side (400GAUI-8) input lanes shall equalize its channel with an adaptive or a fixed Tx input CTLE (0..12 dB) selected through the CMIS staged control set (Page 10h) and applied with ApplyDPInit or ApplyImmediate; the active setting shall be reported in Page 11h.
+  source: CMIS / product
+- id: REQ-SI-002
+  text: Host-side Tx LOS, Tx CDR LOL and Tx adaptive Eq fault flags shall be reported per host lane (8 lanes), not per media lane.
+  source: CMIS / finding F-008
+- id: REQ-DIAG-001
+  text: The module shall provide PRBS generators and checkers on the host and media side (PRBS31Q, PRBS15Q, PRBS13Q, PRBS9Q, PRBS7Q, SSPRQ) controlled through Page 13h, and report BER (F16) or SNR per lane and latched checker LOL in Page 14h.
+  source: CMIS
+- id: REQ-DIAG-002
+  text: Media-side output and host-side output loopbacks shall let a host separate electrical (module DSP) from optical faults without external equipment.
+  source: Bring-up / failure analysis
+- id: REQ-LAB-001
+  text: DVT procedures shall control lab instruments (supply, thermal forcer, source + VOA, power meter, DMM, BERT) through SCPI drivers that run unchanged against simulated instruments, a TCP SCPI port or VISA.
+  source: Test automation
+- id: REQ-LAB-002
+  text: Every instrument transaction shall be recorded with a timestamp and exportable with the test record.
+  source: Test automation / manufacturing records
+- id: REQ-QUAL-001
+  text: Through accelerated laser aging the APC shall hold launch power, the bias warning shall assert at least one year (use-equivalent) before end-of-life shutdown, and life shall be predictable from 2000 h readpoints within 20 %.
+  source: Qualification (HTOL-style readpoints)
+- id: REQ-QUAL-002
+  text: Over temperature cycling between -5 and 75 degC case the module shall stay Ready with all data paths active, without resets, fault flags or uncorrectable FEC codewords.
+  source: Qualification
+- id: REQ-QUAL-003
+  text: The module shall survive at least 1000 power cycles with identity and calibration intact, and NVM wear shall support 20 years at 100 power cycles per day and at one user EEPROM write per hour.
+  source: Qualification / finding F-010
+  unit: [test_cmis_mem]
 - id: REQ-FLT-001
   text: Module over-temperature and supply brown-out shall result in ModuleFault with a readable fault cause.
   source: Product spec

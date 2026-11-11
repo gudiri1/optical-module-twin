@@ -180,12 +180,36 @@ void dpsm_apply_config(struct omt_fw *fw, uint8_t lanes)
 				dp_set_state(fw, &fw->dp[i], CMIS_DP_DEACTIVATED);
 			}
 		}
+		serdes_apply_staged(fw, lanes);
 		if (fw->dsp_ready) {
 			(void)dsp_set_mode(fw, fw->dsp_mode);
 		}
 	}
 	set_cfg_status(fw, lanes, res);
 	omt_log(fw, 0x200 | res, lanes);
+}
+
+/* ApplyImmediate: signal-integrity controls take effect without a data
+ * path re-init. A changed DPConfig needs DPInit, so it goes the
+ * ApplyDPInit way (and is rejected while the data path is in use). */
+static void dpsm_apply_immediate(struct omt_fw *fw, uint8_t lanes)
+{
+	const uint8_t *staged = &fw->m.p10[P10_DPCONFIG - 128];
+	const uint8_t *active = &fw->m.p11[P11_ACTIVE_DPCONFIG - 128];
+
+	if (!lanes) {
+		return;
+	}
+	for (uint8_t l = 0; l < OMT_N_HOST_LANES; l++) {
+		if ((lanes & (1u << l)) && staged[l] != active[l]) {
+			dpsm_apply_config(fw, lanes);
+			return;
+		}
+	}
+	set_cfg_status(fw, lanes, CMIS_CFG_IN_PROGRESS);
+	serdes_apply_staged(fw, lanes);
+	set_cfg_status(fw, lanes, CMIS_CFG_SUCCESS);
+	omt_log(fw, 0x210, lanes);
 }
 
 static bool dp_init_done(struct omt_fw *fw, const struct omt_dp *d)
@@ -220,6 +244,7 @@ static void dp_step(struct omt_fw *fw, struct omt_dp *d)
 					tx_lane_enable(fw, l, true);
 				}
 			}
+			serdes_program(fw, d->media_mask);
 			dp_set_state(fw, d, CMIS_DP_INIT);
 		}
 		break;
@@ -299,6 +324,16 @@ void dpsm_task(struct omt_fw *fw)
 		fw->m.dirty &= ~(DIRTY_APPLY_DPINIT | DIRTY_LANECTRL);
 		fw->hal->irq_unlock(fw->hal->ctx);
 		dpsm_apply_config(fw, lanes);
+	}
+	if (fw->m.dirty & DIRTY_APPLY_IMMED) {
+		uint8_t lanes;
+
+		fw->hal->irq_lock(fw->hal->ctx);
+		lanes = fw->m.p10[P10_APPLY_IMMEDIATE - 128];
+		fw->m.p10[P10_APPLY_IMMEDIATE - 128] = 0; /* self-clearing trigger */
+		fw->m.dirty &= ~DIRTY_APPLY_IMMED;
+		fw->hal->irq_unlock(fw->hal->ctx);
+		dpsm_apply_immediate(fw, lanes);
 	}
 	fw->m.dirty &= ~DIRTY_LANECTRL;
 	if (fw->mstate != CMIS_MS_READY) {

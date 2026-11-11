@@ -172,8 +172,22 @@ static void test_console_smoke(void)
 	free(hw);
 }
 
+/* CMIS F16 (Page 14h BER): value = m * 10^(s - 24), 11-bit mantissa */
+static void test_f16_encode(void)
+{
+	CHECK_EQ(cmis_f16_encode(0.0f), 0);
+	CHECK_EQ(cmis_f16_encode(-1.0f), 0);
+	CHECK_EQ(cmis_f16_encode(2.4e-4f), (18u << 11) | 240u);   /* 240e-6 */
+	CHECK_EQ(cmis_f16_encode(1.0e-12f), (9u << 11) | 1000u);  /* 1000e-15 */
+	CHECK_EQ(cmis_f16_encode(1.0f), (21u << 11) | 1000u);
+	CHECK_EQ(cmis_f16_encode(3.0e-3f), (19u << 11) | 300u);   /* most digits: 300e-5 */
+	CHECK_EQ(cmis_f16_encode(1.0e-30f), 0x0000u | 0u);        /* below range: rounds to 0 */
+	CHECK_EQ(cmis_f16_encode(1.0e12f), 0xFFFFu);              /* above range */
+}
+
 int main(void)
 {
+	RUN(test_f16_encode);
 	RUN(test_alarm_hysteresis);
 	RUN(test_crc32_vector);
 	RUN(test_image_validation);

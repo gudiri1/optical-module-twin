@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>OMT Firmware Status</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Saira+Semi+Condensed:wght@600&family=Source+Sans+3:wght@400;600&display=swap">
+<style>
+/* Layout: one A4-like column: verdict, area table, numbers, open items, next steps */
+:root{--bg:#f4f5f6;--paper:#fff;--ink:#16191d;--ink-2:#4b535c;--ink-3:#727a84;--rule:#d8dce0;
+  --met:#17784a;--met-bg:#e2f2e9;--lim:#8a5a00;--lim-bg:#fbf1d9;--open:#b42318;--open-bg:#fbe7e5;--accent:#1c5cab;
+  --f-d:"Saira Semi Condensed","Arial Narrow",system-ui,sans-serif;--f-b:"Source Sans 3","Segoe UI",system-ui,sans-serif;
+  --f-m:"JetBrains Mono",ui-monospace,Menlo,monospace}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#121417;--paper:#1a1d21;--ink:#eceef0;
+  --ink-2:#b7bec6;--ink-3:#8b939c;--rule:#2d3339;--met:#55c48f;--met-bg:#15301f;--lim:#e0b14a;--lim-bg:#382c10;
+  --open:#f07a70;--open-bg:#3a1a17;--accent:#6da7ec;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#121417;--paper:#1a1d21;--ink:#eceef0;--ink-2:#b7bec6;--ink-3:#8b939c;--rule:#2d3339;
+  --met:#55c48f;--met-bg:#15301f;--lim:#e0b14a;--lim-bg:#382c10;--open:#f07a70;--open-bg:#3a1a17;--accent:#6da7ec;
+  color-scheme:dark}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 var(--f-b);
+  padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+.page{max-width:900px;margin:24px auto 48px;background:var(--paper);border:1px solid var(--rule);
+  padding:28px clamp(16px,4vw,40px);display:grid;gap:22px}
+.eyebrow{font:600 12px/1 var(--f-m);letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3)}
+h1{font:600 30px/1.1 var(--f-d);margin:6px 0 0;text-wrap:balance}
+h2{font:600 18px/1.2 var(--f-d);margin:0 0 8px;text-wrap:balance}
+p{margin:0;max-width:72ch;color:var(--ink-2)}
+.verdict{border-left:4px solid var(--accent);padding:8px 14px;background:var(--bg);color:var(--ink)}
+table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--rule);vertical-align:top}
+th{font:600 11px var(--f-m);letter-spacing:.05em;text-transform:uppercase;color:var(--ink-3)}
+td.n{font-family:var(--f-m);font-size:13px;white-space:nowrap}
+.tw{overflow-x:auto}
+.pill{display:inline-block;font:600 11px/1 var(--f-m);letter-spacing:.05em;padding:4px 7px;border-radius:3px;
+  text-transform:uppercase;white-space:nowrap}
+.met{color:var(--met);background:var(--met-bg)}.limited{color:var(--lim);background:var(--lim-bg)}
+.open{color:var(--open);background:var(--open-bg)}
+.nums{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;background:var(--rule);border:1px solid var(--rule)}
+.nums div{background:var(--paper);padding:10px 12px;display:grid;gap:2px}
+.nums b{font:600 22px/1.1 var(--f-d)}.nums span{font-size:12px;color:var(--ink-3)}
+ul{margin:0;padding-left:20px;display:grid;gap:4px;color:var(--ink-2)}
+li b{color:var(--ink)}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr));gap:22px}
+footer{font-size:12px;color:var(--ink-3)}
+code{font-family:var(--f-m);font-size:.9em}
+@media (max-width:620px){.nums{grid-template-columns:repeat(2,minmax(0,1fr))}}
+</style>
+</head>
+<body>
+
+<div class="page">
+<header>
+  <div class="eyebrow">Status &middot; OMT-400G-DR4 module controller firmware &middot; 2026-11-11 11:26</div>
+  <h1>Where the module firmware stands</h1>
+</header>
+<p class="verdict">All 25 DVT procedures and 3 qualification procedures pass in simulation; 10 of 11 areas meet their limits. The open area is hardware: the next gate is EVT bring-up on first boards with the checklist and bench setup prepared here.</p>
+<div class="nums"><div><b>168/168</b><span>DVT checks passed</span></div><div><b>-7.79 dBm</b><span>RX sensitivity</span></div><div><b>16 dB</b><span>host channel reach</span></div><div><b>1.54</b><span>lowest Cpk after cal</span></div><div><b>800 ms</b><span>ModulePwrUp</span></div><div><b>7.94 W</b><span>max power, 75 C</span></div><div><b>7</b><span>findings fixed</span></div><div><b>41 KiB</b><span>flash on the MCU</span></div></div>
+<section><h2>By area</h2><div class="tw"><table>
+<thead><tr><th>Area</th><th>Status</th><th>Result</th><th>Evidence</th></tr></thead>
+<tbody><tr><td>CMIS management interface</td><td><span class="pill met">met</span></td><td>38/38 requirements with tests</td><td>unit tests, host fuzz, Zephyr decoder cross-check</td></tr><tr><td>Optical receive path</td><td><span class="pill met">met</span></td><td>sensitivity -7.79 dBm at BER 2.4e-4 (limit -6 dBm)</td><td>RX sensitivity waterfall</td></tr><tr><td>Host electrical interface</td><td><span class="pill met">met</span></td><td>BER 2.4e-4 up to 16 dB channel loss, PRBS + loopbacks per lane</td><td>host channel sweep, loopback fault isolation</td></tr><tr><td>Power-up and sequencing</td><td><span class="pill met">met</span></td><td>PwrUp 800 ms (adv. 5 s), DPInit 150 ms, DSP reset hold 19 ms</td><td>timing, oscilloscope capture (F-009 fixed)</td></tr><tr><td>Thermal and power</td><td><span class="pill met">met</span></td><td>max 7.94 W at 75 C case (class 8: 10 W), laser held at 50 C</td><td>temperature sweep</td></tr><tr><td>Fault handling</td><td><span class="pill met">met</span></td><td>12/12 injected faults handled</td><td>fault matrix</td></tr><tr><td>Firmware update (CDB)</td><td><span class="pill met">met</span></td><td>A/B banks, CRC, trial boot with rollback</td><td>CDB update suite</td></tr><tr><td>Manufacturing calibration</td><td><span class="pill met">met</span></td><td>min Cpk 1.54, yield 100 % on 40 units</td><td>calibration station</td></tr><tr><td>Reliability</td><td><span class="pill met">met</span></td><td>bias warning &gt;= 32 y before EOL; EEPROM wear 685 y at 1 write/h (F-010 fixed)</td><td>HTOL readpoints, temperature and power cycling</td></tr><tr><td>Target resources</td><td><span class="pill met">met</span></td><td>40.6 KiB flash, 4.0 KiB RAM on cortex-m4</td><td>tools/footprint.py</td></tr><tr><td>Hardware validation</td><td><span class="pill limited">limited</span></td><td>simulation only; EVT boards not yet available</td><td>docs/hardware.md checklist, bench config ready</td></tr></tbody></table></div></section>
+<div class="cols">
+<section><h2>Open decisions</h2><ul><li><b>F-004</b> Latched-flag semantics after clear-on-read are a spec interpretation</li><li><b>P-4</b> Tx bias scaling factor direction differs between implementations</li></ul></section>
+<section><h2>Accepted limitations</h2><ul><li><b>F-005</b> RX power DDM drifts +0.12 dB from 25 to 79 degC module temperature</li><li><b>F-007</b> Twin DSP model is ~0.2 dB optimistic vs. the equalized link</li></ul></section>
+<section><h2>Host-side fixes prepared upstream</h2><ul><li><b>P-1</b> Review note for Zephyr PR #123842: monitor/id reads clear latched flags</li><li><b>P-2</b> Page-select caching breaks with a second host agent</li><li><b>P-3</b> Review note for Zephyr PR #123842: power_class is the encoded value</li></ul></section>
+<section><h2>Needs hardware or vendor data</h2><ul>
+<li><b>Laser aging law</b> and activation energy from the laser vendor (life numbers are model outputs today)</li>
+<li><b>CMIS offsets</b> checked against the OIF-CMIS text before product use</li>
+<li><b>DSP register map</b> of the selected PAM4 DSP (twin uses a stand-in map)</li>
+<li><b>Mechanical, ESD, damp heat</b> qualification (not modeled)</li>
+</ul></section>
+</div>
+<section><h2>Next steps</h2><ul>
+<li><b>EVT</b>: first power-on with <code>docs/hardware.md</code>; same DVT scripts against the real bench via <code>omt bench --config</code></li>
+<li><b>Twin calibration</b>: load measured L-I curves, TEC data and DSP registers so the twin predicts the boards</li>
+<li><b>Manufacturing</b>: hand the calibration station flow and CSV record format to the pilot line for PVT</li>
+</ul></section>
+<footer>Generated by <code>python -m omt report</code> together with the full verification report (report.html), which holds
+every procedure, check and chart behind these numbers. Simulation results; full run.</footer>
+</div>
+</body>
+</html>

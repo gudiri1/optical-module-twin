@@ -93,6 +93,7 @@ struct omt_hal {
 #define OMT_NVM_FAULTLOG_A    0x2000u
 #define OMT_NVM_FAULTLOG_B    0x3000u
 #define OMT_NVM_BOOT          0x4000u
+#define OMT_NVM_USER_EEPROM_B 0x5000u
 #define OMT_NVM_IMAGE_A       0x8000u
 #define OMT_NVM_IMAGE_B       0xC000u
 #define OMT_NVM_IMAGE_SIZE    0x4000u

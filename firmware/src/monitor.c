@@ -203,6 +203,12 @@ static void update_vendor_pages(struct omt_fw *fw)
 	b0[PB0_APC_STATE - 128] = apc;
 	cmis_set_u16(&b0[PB0_DSP_TEMP - 128], (uint16_t)fw->dsp_temp_dc);
 	cmis_set_u16(&b0[PB0_LAST_FAULT - 128], fw->last_fault);
+	for (int h = 0; h < OMT_N_HOST_LANES; h++) {
+		float snr = fw->host[h].snr_db * 100.0f;
+
+		cmis_set_u16(&b0[PB0_HOST_SNR - 128 + 2 * h], (uint16_t)(snr < 0 ? 0 : snr));
+		b0[PB0_HOST_EQ - 128 + h] = fw->host[h].eq_db;
+	}
 
 	uint8_t *b1 = fw->m.pb1;
 
@@ -366,12 +372,29 @@ void mon_task(struct omt_fw *fw)
 	cmis_latch_lane(fw, P11_FLAG_TX_FAULT, txf);
 	cmis_latch_lane(fw, P11_FLAG_RX_LOS, los);
 	cmis_latch_lane(fw, P11_FLAG_RX_LOL, lol);
-	for (int l = 0; l < 4; l++) {
-		if ((rx_mask & (1u << l)) && fw->rx[l].host_lol) {
-			txlol |= (uint8_t)(1u << l);
+	/* Host-side input flags are per host lane (8), not per media lane:
+	 * host lane h feeds media lane h/2 (docs/findings.md F-008). */
+	uint8_t txlos = 0, txadapt = 0;
+
+	for (uint8_t h = 0; h < OMT_N_HOST_LANES; h++) {
+		const struct omt_host_lane *x = &fw->host[h];
+
+		if (!(rx_mask & (1u << (h / 2)))) {
+			continue;
+		}
+		if (!x->sig) {
+			txlos |= (uint8_t)(1u << h);
+		}
+		if (!x->lock) {
+			txlol |= (uint8_t)(1u << h);
+		}
+		if (x->adapt_fault) {
+			txadapt |= (uint8_t)(1u << h);
 		}
 	}
+	cmis_latch_lane(fw, P11_FLAG_TX_LOS, txlos);
 	cmis_latch_lane(fw, P11_FLAG_TX_LOL, txlol);
+	cmis_latch_lane(fw, P11_FLAG_TX_ADAPT, txadapt);
 	update_vendor_pages(fw);
 	cmis_update_intl(fw);
 	fw->hal->irq_unlock(fw->hal->ctx);

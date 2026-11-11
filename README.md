@@ -9,11 +9,12 @@ verification, manufacturing and analysis around it.
 ┌────────────────────┐  TWI 0x50   ┌──────────────────────────────────────────────────────┐
 │ omt.host.CmisHost  │◄──CMIS 5.x─►│ controller firmware (C11, firmware/)                 │
 │  bring-up, flags,  │  IntL,LPMode│  CMIS memory map · MSM/DPSM · DDM + alarms · CDB     │
-│  CDB fw update     │  ResetL     │  APC · TEC · DSP supervision · fault log · watchdog  │
-│ omt lint / dvt /   │             │──────────── HAL (struct omt_hal) ────────────────────│
-│ mfg / report       │             │ digital twin (C++17, sim/) or Zephyr board port      │
-└────────────────────┘             │  4 lasers+MPD (SPI) · RX PD/TIA (ADC) · TEC (DAC)    │
-                                   │  PAM4 DSP (MDIO Cl.45) · NOR flash · WDT · pins      │
+│  CDB, PRBS, SI     │  ResetL     │  APC · TEC · DSP + host SerDes · PRBS/loopbacks      │
+│ omt lint / dvt /   │             │  fault log · NVM wear leveling · watchdog            │
+│ qual / mfg / report│             │──────────── HAL (struct omt_hal) ────────────────────│
+│ SCPI bench (sim or │             │ digital twin (C++17, sim/) or Zephyr board port      │
+│ VISA / TCP)        │◄─instruments│  4 lasers+MPD (SPI) · RX PD/TIA (ADC) · TEC (DAC)    │
+└────────────────────┘             │  PAM4 DSP + 8 host lanes (MDIO) · rails · NOR · WDT  │
                                    └──────────────────────────────────────────────────────┘
 ```
 
@@ -48,12 +49,12 @@ toolchain on `PATH`. Set `OMT_SIM_LIB` to override the library location.
 |---|---|
 | `firmware/` | Controller firmware, target independent C11, every peripheral behind `include/omt/hal.h` |
 | `sim/` | Hardware twin in C++17 with a C ABI (`omt_sim.h`), 1 ms virtual time, deterministic per seed |
-| `host/omt/` | Python: ctypes binding, Linux i2c-dev bus, CMIS host driver, decoder, lint, VCD trace, DVT, manufacturing, DSP lab, report, CLI |
+| `host/omt/` | Python: ctypes binding, Linux i2c-dev bus, CMIS host driver, decoder, lint, VCD trace, SCPI instruments, DVT, qualification, manufacturing, DSP lab, report and status page, CLI |
 | `ports/zephyr/` | Zephyr application: scheduler thread, I2C target callbacks, flash map, shell bridge; builds and runs on `native_sim` |
 | `tests/` | C unit tests (`unit/`), pytest integration, fault matrix, CDB, DVT, manufacturing, interop |
 | `requirements/` | Requirements with IDs (traced to tests) and the findings log |
-| `docs/` | Architecture, ADRs, bring-up guide, memory map, findings, verification report snapshot |
-| `tools/` | Release script, conformance vector generator, Zephyr PR interop harness |
+| `docs/` | Architecture, ADRs, bring-up guide, hardware reference, qualification plan, memory map, findings, report and status snapshots, example lab bench |
+| `tools/` | Release script, conformance vector generator, Zephyr PR interop harness, Cortex-M footprint |
 
 ## Conformance vectors for host stacks
 
@@ -78,18 +79,27 @@ python -m omt trace --vcd bus.vcd            bring-up on the host bus, open in P
 python -m omt mkimage --version 1.1 -o fw.bin && python -m omt fwupdate fw.bin
 python -m omt dvt [--quick]                  design verification procedures
 python -m omt mfg --units 40 --csv lot.csv   calibration station, Cpk
-python -m omt report                         HTML report with charts and traceability
+python -m omt serdes --loss 14               host lanes: CTLE, SNR, Tx flags; --fixed/--adaptive Eq
+python -m omt prbs --side media --loopback media-output   PRBS BER from the module's checkers
+python -m omt bench [--config lab.yaml]      SCPI instruments (simulated or real), --sweep, --log
+python -m omt qual                           HTOL readpoints, temperature/power cycling, NVM wear
+python -m omt report                         HTML report + one-page status (status.html)
 ```
 `--i2c-bus N` runs `info`, `dump`, `lint` and `mon` against a real module via
 `/dev/i2c-N` (not exercised in CI).
 
 ## Results of the current build
 
-* 155/155 DVT checks in 22 procedures; 12 injected fault scenarios handled
+* 168/168 DVT checks in 25 procedures; 12 injected fault scenarios handled; 38/38 requirements tested
 * RX sensitivity −7.8 dBm average power at pre-FEC BER 2.4e-4 (limit −6 dBm)
-* ModulePwrUp 780 ms (advertised ≤ 5 s), DPInit 140 ms (≤ 1 s), ≤ 7.9 W at 75 °C case (class 8, 10 W)
+* Host interface: adaptive CTLE reaches 16 dB channel loss at BER 2.4e-4 (fixed 0 dB: 8 dB); PRBS and
+  loopbacks isolate optical, host-channel and DSP faults
+* ModulePwrUp 800 ms (advertised ≤ 5 s), DPInit 150 ms (≤ 1 s), DSP reset hold 20 ms on the scope, ≤ 7.9 W at 75 °C case (class 8, 10 W)
 * Calibration: Cpk ≥ 1.5 on all DDM parameters after calibration (0.4–1.7 before), 100 % yield on 40 units
-* 7 firmware findings (F-001…F-007) and 4 host-side notes (P-1…P-4), see `docs/findings.md`
+* Qualification: APC holds launch power through accelerated aging, bias warning decades before EOL,
+  life predicted from 2000 h readpoints within 6 %; 1000 power cycles; NVM wear ≥ 685 years at one EEPROM write per hour
+* Cortex-M4F: 40.6 KiB flash, 4.0 KiB RAM (`tools/footprint.py`)
+* 10 firmware findings (F-001…F-010) and 4 host-side notes (P-1…P-4), see `docs/findings.md`
 * Zephyr: fixes for P-1/P-3 and a follow-up for P-2 tested with twister (33/33 on native_sim), to be posted on #123842
 
 ## Status

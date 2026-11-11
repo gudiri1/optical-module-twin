@@ -32,11 +32,13 @@ Modeled on CMIS 5.x; verify offsets against the OIF-CMIS text before product use
 | Page | Content |
 |---|---|
 | 00h | vendor name/OUI/PN/rev/SN/date/CLEI, power class 8, max power 10 W, MPO-12, checksum at 222 |
-| 01h | inactive FW version, HW rev, 1311 nm ± 6.5 nm, durations, supported monitors, checksum at 255 |
+| 01h | inactive FW version, HW rev, 1311 nm ± 6.5 nm, pages supported 142 (b5 = 13h-14h), durations, max Tx input Eq 153, SI capabilities 161-162, supported monitors, checksum at 255 |
 | 02h | thresholds HA/LA/HW/LW for temp, Vcc, Aux1, Aux2, TX power, TX bias, RX power, checksum at 255 |
 | 03h | user EEPROM, persistent |
-| 10h | DPDeinit 128, TX disable 130, ApplyDPInit 143, DPConfig 145-152, lane flag masks 213-231 |
-| 11h | DP state 128-131, output status 132-133, latched lane flags 134-152 (COR), TX power / bias / RX power 154-201, config status 202-205, active config 206-213 |
+| 10h | DPDeinit 128, TX disable 130, ApplyDPInit 143, ApplyImmediate 144, DPConfig 145-152, staged SI 153-173 (adaptive Eq 153, fixed Tx input Eq 156-159, CDR 160/161, Rx output pre/post/amplitude 162-173), lane flag masks 213-231 |
+| 11h | DP state 128-131, output status 132-133, latched lane flags 134-152 (COR; Tx LOS/CDR LOL/adaptive Eq fault 136-138 per host lane), TX power / bias / RX power 154-201, config status 202-205, active config 206-213, active SI 214-234 |
+| 13h | diagnostics: loopback caps 128, pattern caps 129-139, host/media generator and checker enables + patterns 144-175, counter reset 177 b7, loopbacks 180-183 |
+| 14h | results: selector 128 (1 = BER F16, 6 = SNR 1/256 dB), latched checker LOL 136/137 (COR), host lanes 192-207, media lanes 208-215 |
 | 9Fh | CDB LPL: CMD 128, EPL len 130, LPL len 132, check code 133, RPL len/check 134-135, payload 136-255 |
-| B0h | vendor diagnostics: uptime, reset count/reason, boot bank, fault log size, I2C error counters, DSP recoveries, pre-FEC BER (float), SNR, FEC counters, TEC setpoint, APC state, DSP temperature, last event |
+| B0h | vendor diagnostics: uptime, reset count/reason, boot bank, fault log size, I2C error counters, DSP recoveries, pre-FEC BER (float), SNR, FEC counters, TEC setpoint, APC state, DSP temperature, last event, host lane SNR 208-223, host CTLE 224-231 |
 | B1h | factory calibration (needs password 0x4F4D5401): raw ADC at 128-147, coefficients 160-247, command 255 (A5 commit, 5A reload, C3 defaults) |

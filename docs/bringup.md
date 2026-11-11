@@ -35,13 +35,90 @@
 | 30.0040+4n | ERR/BITS | 32-bit error count, 32-bit bit count in 2^16 units |
 | 30.0060+n / 0068+n | FEC | corrected / uncorrectable RS(544,514) codewords |
 | 30.0070 | DIE_TEMP | 0.1 °C |
+| 30.0100+h | HCTRL | host lane h (0..7): b0 adaptive CTLE, b7..4 fixed peaking dB |
+| 30.0110+h | HSTAT | b0 signal detect, b1 host CDR lock, b2 adaptation done |
+| 30.0120+h / 0130+h | HSNR / HEQ | host input SNR 0.01 dB / CTLE in use dB |
+| 30.0200..0206 | PRBS / loopback | generator and checker enables (host 8 bits, media 4 bits), loopback masks |
+| 30.0208+h / 0210+m | PATTERN | CMIS pattern code per lane |
+| 30.0218 | CHK_LOCK | b7..0 host checkers, b11..8 media checkers |
+| 30.021A | CHK_SNAP | b0 latch checker counters, b1 discard |
+| 30.0220+4h / 0240+4m | CHK counters | errors and bits (2^16 units) like 30.0040 |
+
+Host lane h feeds media lane h/2 in both applications.
+
+## Power-up on the oscilloscope
+
+`dvt.power_sequencing_scope()` (part of `omt dvt`) arms the scope on the
+laser-driver rail (CH1, rising, 1.65 V, 100 ms/div), releases LowPwr over TWI
+and measures:
+
+| Probe | Net | Expect (twin, 1 ms resolution) |
+|---|---|---|
+| CH1 | laser driver 3.3 V rail | trigger, t = 0 |
+| CH2 | DSP core 0.75 V rail | in regulation at +2 ms, monotonic |
+| CH3 | DSP_RSTN | one rising edge, ≥ 20 ms after CH2 starts (19 ms measured = 20 ms minus one sample) |
+| CH4 | IntL | falls at ModuleReady, about +770 ms |
+
+The capture exports to VCD (`vcd.write_waveforms`) for GTKWave/PulseView. The
+first version of this check measured 9 ms of reset hold: finding F-009.
+
+## Host lanes and PRBS
+
+```
+python -m omt serdes --loss 14                     # CTLE, SNR, Tx flags per host lane
+python -m omt serdes --fixed 4                     # fixed Tx input Eq via ApplyImmediate
+python -m omt prbs --side host --host-prbs PRBS31Q # module checker on the host lanes
+python -m omt prbs --side media --loopback media-output     # DSP only, no optics
+python -m omt prbs --side media --fiber-loopback 6          # optics in the loop
+```
+
+Isolation rule used by `dvt.loopback_isolation()`: errors with fiber
+loopback but none with media-output loopback point at the optical path
+(connector, laser, PD); errors from the host but none with host-output
+loopback point at the host channel, not the module SerDes.
 
 ## Console (UART, `python -m omt console`)
 
 ```
-help ver state mon lanes dsp faults [n] log tasks tec cal
+help ver state mon lanes dsp serdes faults [n] log tasks tec cal
 mdio r <dev> <reg> | mdio w <dev> <reg> <val> | ld r <reg> | reset
 ```
+
+## Source-level debugging
+
+**On the twin (any PC).** The firmware runs inside `libomt_sim`, built with
+`-g`, so gdb debugs it like target code. A session from development (MinGW
+gdb, Windows), stopping in the DSP hang recovery:
+
+```
+$ gdb -q -batch -x dbg.cmd --args python repro.py     # repro.py: bring up, set dsp_hang=1, run 2 s
+(gdb) set breakpoint pending on
+(gdb) break dsp_recover if fw->dsp_rec_step == 4
+(gdb) run
+Thread 1 hit Breakpoint 1, dsp_recover (fw=0xec4d70) at firmware/src/dsp.c:359
+#1  dsp_task (fw=0xec4d70) at firmware/src/dsp.c:410
+#2  omt_fw_tick (fw=0xec4d70) at firmware/src/fw.c:243
+#3  omt_sim::run (this=0xec4370, ms=2000) at sim/src/twin.cpp:675
+(gdb) print fw->dsp_recoveries_in_row
+$2 = 1
+(gdb) print fw->host[0]
+$5 = {snr_db = 25, eq_db = 8, sig = true, lock = true, adapt_done = true, adapt_fault = false}
+```
+
+Virtual time stops while the debugger holds the process, so breakpoints do
+not trip the watchdog, unlike on hardware.
+
+**On a board (SWD/JTAG).** `west build -b <board> ports/zephyr`, then
+`west debug` (OpenOCD or J-Link runner from the board definition) or
+`west debugserver` plus `arm-none-eabi-gdb build/zephyr/zephyr.elf` and
+`target remote :3333`. Useful starting points:
+
+| Symptom | Break / watch |
+|---|---|
+| module goes to Fault | `break msm_enter_fault`, then `bt` and `print cause` |
+| host sees a wrong byte | `watch fw.m.lower[<offset>]` (hardware watchpoint) |
+| watchdog resets | the watchdog keeps running while halted: disable it in the debug build (`CONFIG_WDT_DISABLE_AT_BOOT`) or let OpenOCD freeze it in debug mode (`DBGMCU`) |
+| timing (sequence, ISR load) | toggle a spare GPIO in the code path and put it on the scope next to the rails |
 
 ## Debug flow that worked during development
 

@@ -91,11 +91,58 @@ static void test_user_eeprom_persists_coalesced(void)
 		fake_run(&hw, fw, 10);
 	}
 	fake_run(&hw, fw, 700);
-	CHECK_EQ(hw.erases - e0, 1);                  /* 16 writes, one erase */
+	CHECK(hw.erases - e0 <= 1);                   /* 16 writes, one save */
 	/* "power cycle": new firmware instance on the same flash */
 	omt_fw_init(fw, &hw.hal);
 	host_write1(fw, CMIS_PAGE_SELECT, 0x03);
 	CHECK_EQ(host_read1(fw, 128 + 8 * 5), 5);
+	teardown();
+}
+
+static void save_burst(uint8_t v)
+{
+	uint8_t d[4] = { v, (uint8_t)(v + 1), (uint8_t)(v + 2), (uint8_t)(v + 3) };
+
+	host_write(fw, 200, d, 4);
+	fake_run(&hw, fw, 700);
+}
+
+/* F-010: log-structured, two sectors: one erase per ~29 saves, and a save
+ * interrupted by power loss falls back to the previous copy. */
+static void test_user_eeprom_wear_and_power_fail(void)
+{
+	setup();
+	host_write1(fw, CMIS_PAGE_SELECT, 0x03);
+	uint32_t e0 = hw.erases;
+
+	for (int i = 0; i < 100; i++) {
+		save_burst((uint8_t)i);
+	}
+	CHECK(hw.erases - e0 <= 4);                   /* was 100 */
+	omt_fw_init(fw, &hw.hal);
+	host_write1(fw, CMIS_PAGE_SELECT, 0x03);
+	CHECK_EQ(host_read1(fw, 200), 99);
+
+	/* power lost while programming save #101: corrupt the newest slot */
+	save_burst(0xA0);
+	/* 29 slots per sector: saves 1-29 A, 30-58 B, 59-87 A, 88-101 B, so the
+	 * newest record ends at the last programmed byte of sector B */
+	uint32_t newest = 0;
+
+	for (uint32_t addr = OMT_NVM_USER_EEPROM_B; addr < OMT_NVM_USER_EEPROM_B + OMT_NVM_SECTOR; addr++) {
+		if (hw.flash[addr] != 0xFF) {
+			newest = addr;
+		}
+	}
+	CHECK(newest != 0);
+	hw.flash[newest] = 0x00;                      /* torn CRC */
+	omt_fw_init(fw, &hw.hal);
+	host_write1(fw, CMIS_PAGE_SELECT, 0x03);
+	CHECK_EQ(host_read1(fw, 200), 99);            /* previous copy */
+	save_burst(0xB0);                             /* skips the torn slot */
+	omt_fw_init(fw, &hw.hal);
+	host_write1(fw, CMIS_PAGE_SELECT, 0x03);
+	CHECK_EQ(host_read1(fw, 200), 0xB0);
 	teardown();
 }
 
@@ -165,6 +212,7 @@ int main(void)
 	RUN(test_identity_and_checksums);
 	RUN(test_readonly_and_paging);
 	RUN(test_user_eeprom_persists_coalesced);
+	RUN(test_user_eeprom_wear_and_power_fail);
 	RUN(test_clear_on_read_and_intl);
 	RUN(test_password_write_only_and_unlock);
 	RUN(test_sequential_read_crosses_into_upper);

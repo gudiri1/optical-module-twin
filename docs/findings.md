@@ -51,6 +51,27 @@ Source of truth: `requirements/findings.yaml` (also rendered in the HTML report)
 * **Root cause:** Measured BER after FFE is ~1.2-1.3x the closed form at the measured SNR (residual ISI is not Gaussian, LMS misadjustment).
 * **Action:** Accepted for system-level simulation; noted where sensitivity margins are quoted.
 
+## F-008 - Host-side Tx LOL flag was reported on the media lane bit
+
+* **Status:** fixed
+* **Found by:** Implementing per-host-lane SerDes supervision (REQ-SI-002) and reviewing Page 11h byte 137
+* **Root cause:** The firmware derived Tx CDR LOL from one host-lock bit per media lane and latched it at bit l of the media lane. Page 11h host-side flags are per host lane, so an electrical fault on host lanes 5-6 (media lane 3) appeared as host lane 3 and the second lane of each pair was never reported. Tx LOS and Tx adaptive Eq fault were not reported at all.
+* **Action:** The DSP reports lock, signal detect and adaptation per host lane; monitor.c latches Tx LOS, Tx CDR LOL and Tx adaptive Eq fault per host lane. test_host_lol_is_per_host_lane covers it.
+
+## F-009 - DSP reset released after ~10 ms instead of 20 ms
+
+* **Status:** fixed
+* **Found by:** Oscilloscope capture of the power-up sequence (dvt.power_sequencing_scope) - DSP_RSTN rose 9 ms after the DSP rail
+* **Root cause:** The power-up steps timed their delays from entering ModulePwrUp (mstate_t). The rails are switched in step 0, which runs one msm period (10 ms) later, so the reset hold the bring-up guide specifies (20 ms after the rails) shrank to about 10 ms. No functional symptom in the twin; on hardware a DSP with a minimum reset-after-supply time could start from an undefined state.
+* **Action:** Step 0 records the rail switch-on time and steps 1 and 2 count from it (msm.c). The scope procedure checks the hold time on every run.
+
+## F-010 - User EEPROM erased its flash sector on every host write
+
+* **Status:** fixed
+* **Found by:** Qualification, NVM wear projection in qual.power_cycling (1 erase per coalesced Page 03h write)
+* **Root cause:** nvm_save_user_eeprom() erased sector 0x1000 and programmed one record each time. With 100k erase cycles a host writing Page 03h once a minute wears the sector out in about 10 weeks (once an hour in 11 years), and a power loss between erase and program loses the page.
+* **Action:** Append-only log over two sectors used in turn (0x1000 and 0x5000, 29 records each); the other sector is erased only when one is full, so the newest copy is never being erased. Old single-record format is still read once after a firmware update. One write per hour now projects to 685 years, one per minute to 11 years. Unit test test_user_eeprom_wear_and_power_fail.
+
 ## P-1 - Review note for Zephyr PR #123842: monitor/id reads clear latched flags
 
 * **Status:** fix prepared

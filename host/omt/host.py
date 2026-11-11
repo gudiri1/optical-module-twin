@@ -74,7 +74,7 @@ class CmisHost:
         self.select(page, bank)
         return self.read(128, 128)
 
-    def snapshot(self, pages=(0x00, 0x01, 0x02, 0x10, 0x11, 0xB0)) -> cmis.CmisImage:
+    def snapshot(self, pages=(0x00, 0x01, 0x02, 0x10, 0x11, 0x13, 0x14, 0xB0)) -> cmis.CmisImage:
         img = cmis.CmisImage(self.lower(), {})
         for p in pages:
             img.pages[p] = self.upper(p)
@@ -157,6 +157,94 @@ class CmisHost:
 
     def password(self, pw: int) -> None:
         self.write(122, struct.pack(">I", pw))
+
+    # ------------------------------------------------- host signal integrity
+    def set_host_eq(self, adaptive: bool = True, fixed_db: int = 0, lanes: int = 0xFF,
+                    immediate: bool = True) -> list[str]:
+        """Stage Tx input Eq (Page 10h 153/156..159) and apply it, by default
+        with ApplyImmediate (no data path re-init). Returns config status."""
+        self.select(0x10)
+        cur = self.read(153, 7)
+        adapt = (cur[0] | lanes) if adaptive else (cur[0] & ~lanes & 0xFF)
+        eq = bytearray(cur[3:7])
+        for h in range(8):
+            if lanes >> h & 1:
+                sh = 4 * (h & 1)
+                eq[h // 2] = (eq[h // 2] & ~(0xF << sh) & 0xFF) | ((fixed_db & 0xF) << sh)
+        self.write(153, adapt)
+        self.write(156, bytes(eq))
+        self.write(144 if immediate else 143, lanes)
+        self.wait(lambda: all(s != 0xC for s in self._cfg_status()), 1000)
+        return [cmis.CFG_STATUS.get(s, hex(s)) for s in self._cfg_status()]
+
+    def host_lanes(self, flags: bool = False) -> list[dict]:
+        """Host-side lane status: SNR and CTLE from B0h, active Eq from Page 11h.
+        Only reads the latched (clear-on-read) Tx flags when flags=True."""
+        b0 = cmis.decode_pageB0(self.upper(0xB0))
+        self.select(0x11)
+        si = cmis._si(bytes(214) + self.read(214, 21), 214)
+        fl = self.read(136, 3) if flags else bytes(3)
+        names = ("tx_los", "tx_cdr_lol", "tx_adapt_eq_fault")
+        return [{"host_lane": h + 1, "snr_db": b0["host_snr_db"][h], "eq_db": b0["host_eq_db"][h],
+                 "adaptive": si[h]["adaptive_eq"],
+                 "flags": [n for n, v in zip(names, fl) if v >> h & 1]} for h in range(8)]
+
+    # ------------------------------------------------------ PRBS diagnostics
+    def prbs(self, side: str, pattern: str = "PRBS31Q", lanes: int | None = None,
+             generator: bool = True, checker: bool = True, loopback: str | None = None) -> None:
+        """Configure Page 13h. side 'host' (8 lanes) or 'media' (4 lanes);
+        loopback one of cmis.LOOPBACKS or None. Counters restart."""
+        n = 8 if side == "host" else 4
+        lanes = ((1 << n) - 1) if lanes is None else lanes
+        code = cmis.PATTERN_CODES[pattern]
+        pat = bytes([(code << 4) | code] * 4)
+        gen_off, chk_off = (144, 160) if side == "host" else (152, 168)
+        self.select(0x14)
+        self.write(128, 1)                     # results selector: BER
+        self.read(134, 4)                      # clear stale checker LOL flags
+        self.select(0x13)
+        self.write(gen_off + 4, pat)
+        self.write(chk_off + 4, pat)
+        for off in cmis.LOOPBACKS.values():
+            self.write(off, 0)
+        if loopback:
+            self.write(cmis.LOOPBACKS[loopback], lanes)
+        self.write(gen_off, lanes if generator else 0)
+        self.write(chk_off, lanes if checker else 0)
+
+    def prbs_stop(self) -> None:
+        self.select(0x13)
+        for off in (144, 152, 160, 168, *cmis.LOOPBACKS.values()):
+            self.write(off, 0)
+
+    def prbs_reset_counters(self) -> None:
+        self.select(0x13)
+        self.write(177, 0x80)
+
+    def prbs_results(self) -> dict:
+        """BER per lane (Page 14h, selector BER) plus checker LOL (clears it)."""
+        self.select(0x14)
+        if self.read(128, 1)[0] != 1:
+            self.write(128, 1)
+            self.bus.wait_ms(40)
+        return cmis.decode_page14(self.upper(0x14))
+
+    def prbs_measure(self, side: str, seconds: float, pattern: str = "PRBS31Q",
+                     loopback: str | None = None, lanes: int | None = None) -> dict:
+        """Run a generator/checker pair for `seconds` and return the BER.
+        A lane whose checker lost lock at any time reports ber None."""
+        self.prbs(side, pattern, lanes, loopback=loopback)
+        self.bus.wait_ms(100)                  # programmed by the diag task
+        self.prbs_reset_counters()
+        self.bus.wait_ms(int(seconds * 1000) + 1100)
+        r = self.prbs_results()
+        self.prbs_stop()
+        lol = r[f"{side}_checker_lol"]
+        n = 8 if side == "host" else 4
+        mask = ((1 << n) - 1) if lanes is None else lanes
+        ber = [None if (lol >> i & 1) else v for i, v in enumerate(r[side])]
+        return {"side": side, "pattern": pattern, "loopback": loopback, "seconds": seconds,
+                "ber": [b if mask >> i & 1 else None for i, b in enumerate(ber)], "lol": lol & mask}
 
     # --------------------------------------------------------------- CDB
     @staticmethod

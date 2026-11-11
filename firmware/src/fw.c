@@ -219,6 +219,7 @@ void omt_fw_init(struct omt_fw *fw, const struct omt_hal *hal)
 	add_task(fw, "tec", 10, tec_task);
 	add_task(fw, "mon", 20, mon_task);
 	add_task(fw, "dsp", 100, dsp_task);
+	add_task(fw, "diag", 20, diag_task);
 	add_task(fw, "house", 50, housekeeping_task);
 	add_task(fw, "console", 10, console_task);
 	mon_task(fw); /* prime monitors before the host can read them */

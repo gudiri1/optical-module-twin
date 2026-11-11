@@ -1,0 +1,15 @@
+# Example description of a real DVT bench for `omt bench --config` and
+# `Bench.from_yaml()`. One SCPI resource per role:
+#   socket://<host>[:port]   raw SCPI over TCP (LXI instruments, port 5025)
+#   anything else            a VISA resource string (needs `pip install pyvisa`)
+#
+# The drivers in host/omt/instruments.py use a small, common SCPI subset.
+# Check each instrument's programming guide and adapt the driver class where
+# its command set differs (for example the power meter's channel switch).
+supply: socket://192.168.10.21:5025          # programmable DC supply, module Vcc
+forcer: TCPIP0::192.168.10.22::inst0::INSTR  # thermal stream on the module case
+voa:    socket://192.168.10.23:5025          # calibrated 1311 nm source + VOA, MPO fan-in to RX
+pm:     socket://192.168.10.24:5025          # optical power meter + 1x4 switch on TX fan-out
+dmm:    USB0::0x2A8D::0x1301::MY00000000::INSTR  # DMM with thermocouple scanner (@1 case, @2 laser plate)
+bert:   socket://192.168.10.25:5025          # pattern generator: port 1 host lanes, port 2 line side
+scope:  TCPIP0::192.168.10.26::hislip0::INSTR  # 4-channel scope: TX rail, DSP rail, DSP_RSTN, IntL

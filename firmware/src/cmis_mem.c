@@ -78,6 +78,8 @@ uint8_t *cmis_page(struct omt_fw *fw, uint8_t page)
 	case 0x03: return fw->m.p03;
 	case 0x10: return fw->m.p10;
 	case 0x11: return fw->m.p11;
+	case 0x13: return fw->m.p13;
+	case 0x14: return fw->m.p14;
 	case 0x9F: return fw->m.p9f;
 	case PAGE_VENDOR_DIAG: return fw->m.pb0;
 	case PAGE_VENDOR_CAL: return fw->m.pb1;
@@ -158,7 +160,10 @@ void cmis_mem_init(struct omt_fw *fw)
 	p[P01_HW_REV_MINOR - 128] = 0;
 	cmis_set_u16(&p[P01_WAVELENGTH - 128], 26220);   /* 1311.0 nm */
 	cmis_set_u16(&p[P01_WAVELENGTH_TOL - 128], 1300); /* +/- 6.5 nm */
-	p[P01_PAGES_SUPPORTED - 128] = 0x04;             /* page 03h present */
+	p[P01_PAGES_SUPPORTED - 128] = 0x04 | 0x20;      /* page 03h, pages 13h-14h */
+	p[P01_SI_MAX_EQ - 128] = 12;                     /* Tx input Eq up to 12 dB */
+	p[P01_SI_TX_CAP - 128] = 0x01 | 0x04 | 0x08;     /* Tx CDR, fixed + adaptive input Eq */
+	p[P01_SI_RX_CAP - 128] = 0x01;                   /* Rx CDR */
 	p[P01_DUR_DP - 128] = (0x5 << 4) | 0x6;          /* deinit 100-500 ms, init 0.5-1 s */
 	p[P01_MOD_MON_SUPPORT - 128] = 0x0F;             /* temp, vcc, aux1, aux2 */
 	p[P01_LANE_MON_SUPPORT - 128] = 0x07;            /* bias x1, txpwr, rxpwr */
@@ -175,6 +180,12 @@ void cmis_mem_init(struct omt_fw *fw)
 		m->p10[P10_DPCONFIG - 128 + i] = (1u << 4);
 		m->p11[P11_ACTIVE_DPCONFIG - 128 + i] = (1u << 4);
 	}
+	/* host-side SI defaults: adaptive Tx input Eq, both CDRs on */
+	m->p10[P10_SI_ADAPT_EQ - 128] = 0xFF;
+	m->p10[P10_SI_TX_CDR - 128] = 0xFF;
+	m->p10[P10_SI_RX_CDR - 128] = 0xFF;
+	memcpy(&m->p11[P11_SI_ADAPT_EQ - 128], &m->p10[P10_SI_ADAPT_EQ - 128],
+	       P10_SI_LAST - P10_SI_ADAPT_EQ + 1);
 
 	/* ---- page 11h ---- */
 	for (uint8_t l = 0; l < 8; l++) {
@@ -184,6 +195,7 @@ void cmis_mem_init(struct omt_fw *fw)
 		m->p11[P11_CFG_STATUS - 128 + i] = (CMIS_CFG_SUCCESS << 4) | CMIS_CFG_SUCCESS;
 	}
 
+	diag_init(fw);
 	nvm_load_user_eeprom(fw);
 	cmis_update_checksums(fw);
 	cmis_update_intl(fw);
@@ -248,6 +260,16 @@ void cmis_latch_lane(struct omt_fw *fw, uint8_t flag_off, uint8_t cond)
 	uint8_t rising = latch_bits(cond, *prev);
 
 	fw->m.p11[flag_off - 128] |= rising;
+	*prev = cond;
+}
+
+/* Page 14h diagnostic flags: same latching policy, not routed to IntL
+ * in this design (no Page 13h masks implemented). */
+void cmis_latch_diag(struct omt_fw *fw, uint8_t flag_off, uint8_t cond)
+{
+	uint8_t *prev = &fw->m.cond_diag[flag_off - P14_FLAG_FIRST];
+
+	fw->m.p14[flag_off - 128] |= latch_bits(cond, *prev);
 	*prev = cond;
 }
 
@@ -323,8 +345,12 @@ static bool upper_writable(const struct omt_fw *fw, uint8_t page, uint8_t off)
 		return true;
 	case 0x10:
 		return off <= P10_TX_SQ_DISABLE ||
-		       (off >= P10_APPLY_DPINIT && off < P10_DPCONFIG + 8) ||
+		       (off >= P10_APPLY_DPINIT && off <= P10_SI_LAST) ||
 		       (off >= P10_MASK_BASE && off <= P10_MASK_BASE + (P11_FLAG_LAST - P11_FLAG_FIRST));
+	case 0x13:
+		return off >= P13_CTRL_FIRST && off <= P13_CTRL_LAST;
+	case 0x14:
+		return off == P14_SELECTOR;
 	case 0x9F:
 		return true;
 	case PAGE_VENDOR_CAL:
@@ -339,7 +365,8 @@ static bool is_clear_on_read(uint8_t page, uint8_t off)
 	if (off < 128) {
 		return off >= CMIS_FLAG_MODULE && off <= CMIS_FLAG_AUX3;
 	}
-	return page == 0x11 && off >= P11_FLAG_FIRST && off <= P11_FLAG_LAST;
+	return (page == 0x11 && off >= P11_FLAG_FIRST && off <= P11_FLAG_LAST) ||
+	       (page == 0x14 && off >= P14_FLAG_FIRST && off <= P14_FLAG_LAST);
 }
 
 int omt_i2c_write(struct omt_fw *fw, const uint8_t *buf, size_t len)
@@ -372,7 +399,11 @@ int omt_i2c_write(struct omt_fw *fw, const uint8_t *buf, size_t len)
 					fw->m.dirty |= DIRTY_LANECTRL;
 					if (off == P10_APPLY_DPINIT) {
 						fw->m.dirty |= DIRTY_APPLY_DPINIT;
+					} else if (off == P10_APPLY_IMMEDIATE) {
+						fw->m.dirty |= DIRTY_APPLY_IMMED;
 					}
+				} else if (page == 0x13) {
+					fw->m.dirty |= DIRTY_DIAG;
 				} else if (page == 0x03) {
 					fw->m.dirty |= DIRTY_USER_EEPROM;
 					fw->m.user_eeprom_dirty_ms = omt_now(fw);

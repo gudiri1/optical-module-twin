@@ -56,6 +56,24 @@ P11_FLAGS = {
 }
 
 
+# Page 13h/14h diagnostics (CMIS 5.x as modeled by the firmware)
+PATTERNS = {0: "PRBS31Q", 1: "PRBS31", 2: "PRBS23Q", 3: "PRBS23", 4: "PRBS15Q", 5: "PRBS15",
+            6: "PRBS13Q", 7: "PRBS13", 8: "PRBS9Q", 9: "PRBS9", 10: "PRBS7Q", 11: "PRBS7",
+            12: "SSPRQ", 14: "Custom", 15: "User"}
+PATTERN_CODES = {v: k for k, v in PATTERNS.items()}
+LOOPBACKS = {"media-output": 180, "media-input": 181, "host-output": 182, "host-input": 183}
+P14_SEL = {1: "BER", 6: "SNR"}
+
+
+def f16(v: int) -> float:
+    """CMIS F16: exponent bits 15..11, mantissa bits 10..0, value m * 10^(e-24)."""
+    return (v & 0x7FF) * 10.0 ** ((v >> 11) - 24)
+
+
+def _nib(b: bytes, off: int, lane: int) -> int:
+    return (b[off + lane // 2] >> (4 * (lane & 1))) & 0xF
+
+
 def u16(b: bytes, off: int) -> int:
     return (b[off] << 8) | b[off + 1]
 
@@ -264,12 +282,21 @@ def decode_page02(p: bytes) -> dict:
     }
 
 
+def _si(b: bytes, base: int) -> list[dict]:
+    """Signal-integrity control set (Page 10h staged at 153, Page 11h active at 214)."""
+    return [{"host_lane": h + 1, "adaptive_eq": bool(b[base] >> h & 1),
+             "fixed_eq_db": _nib(b, base + 3, h), "tx_cdr": bool(b[base + 7] >> h & 1),
+             "rx_cdr": bool(b[base + 8] >> h & 1), "rx_pre": _nib(b, base + 9, h),
+             "rx_post": _nib(b, base + 13, h), "rx_amplitude": _nib(b, base + 17, h)} for h in range(8)]
+
+
 def decode_page10(p: bytes) -> dict:
     b = bytes(128) + p
     return {
         "dp_deinit": b[128], "tx_disable": b[130],
         "staged_dpconfig": [{"appsel": b[145 + i] >> 4, "dpid": (b[145 + i] >> 1) & 7}
                             for i in range(8)],
+        "staged_si": _si(b, 153),
     }
 
 
@@ -291,12 +318,16 @@ def decode_page11(p: bytes, media_lanes: int = 4) -> dict:
             "lane": i + 1, "tx_power_uw": tx, "tx_power_dbm": uw_to_dbm(tx),
             "tx_bias_ma": u16(b, 170 + 2 * i) * 0.002,
             "rx_power_uw": rx, "rx_power_dbm": uw_to_dbm(rx),
-            "flags": [n for off, n in P11_FLAGS.items() if b[off] & (1 << i)],
+            "flags": [n for off, n in P11_FLAGS.items() if off not in (136, 137, 138) and b[off] & (1 << i)],
         })
     return {
         "dp_state": dp, "config_status": cfg,
         "output_status_tx": b[133], "output_status_rx": b[132],
         "active_appsel": [b[206 + i] >> 4 for i in range(8)],
+        "active_si": _si(b, 214),
+        "host_lanes": [{"host_lane": h + 1,
+                        "flags": [n for off, n in P11_FLAGS.items() if off in (136, 137, 138) and b[off] >> h & 1]}
+                       for h in range(8)],
         "lanes": lanes,
         "flag_bytes": {n: b[off] for off, n in P11_FLAGS.items()},
     }
@@ -316,6 +347,42 @@ def decode_pageB0(p: bytes) -> dict:
         "fec_uncorrectable": list(struct.unpack(">4I", b[184:200])),
         "tec_setpoint_c": s16(b, 200) / 256, "apc_converged": b[202],
         "dsp_temp_c": s16(b, 204) / 10, "last_event": EVENTS.get(u16(b, 206), hex(u16(b, 206))),
+        "host_snr_db": [u16(b, 208 + 2 * h) / 100 for h in range(8)],
+        "host_eq_db": [b[224 + h] for h in range(8)],
+    }
+
+
+def _pats(v: int) -> list[str]:
+    return [PATTERNS[i] for i in range(16) if v >> i & 1 and i in PATTERNS]
+
+
+def decode_page13(p: bytes) -> dict:
+    b = bytes(128) + p
+
+    def side(en_off, pat_off, n):
+        return [{"lane": i + 1, "enabled": bool(b[en_off] >> i & 1),
+                 "pattern": PATTERNS.get(_nib(b, pat_off, i), "reserved")} for i in range(n)]
+    lb = b[128]
+    return {
+        "loopback_caps": [n for n, bit in (("media-output", 0), ("media-input", 1), ("host-output", 2),
+                                           ("host-input", 3)) if lb >> bit & 1],
+        "host_generator_patterns": _pats(u16(b, 132)), "media_generator_patterns": _pats(u16(b, 134)),
+        "host_checker_patterns": _pats(u16(b, 136)), "media_checker_patterns": _pats(u16(b, 138)),
+        "host_generator": side(144, 148, 8), "media_generator": side(152, 156, 4),
+        "host_checker": side(160, 164, 8), "media_checker": side(168, 172, 4),
+        "loopbacks": {n: b[off] for n, off in LOOPBACKS.items()},
+    }
+
+
+def decode_page14(p: bytes) -> dict:
+    b = bytes(128) + p
+    sel = b[128]
+    conv = f16 if sel == 1 else (lambda v: v / 256) if sel == 6 else (lambda v: v)
+    return {
+        "selector": P14_SEL.get(sel, sel),
+        "host_checker_lol": b[136], "media_checker_lol": b[137],
+        "host": [conv(u16(b, 192 + 2 * h)) for h in range(8)],
+        "media": [conv(u16(b, 208 + 2 * m)) for m in range(4)],
     }
 
 
@@ -344,7 +411,8 @@ def decode(img: CmisImage) -> dict:
     if img.lower:
         out["lower"] = decode_lower(img.lower)
     dec = {0x00: decode_page00, 0x01: decode_page01, 0x02: decode_page02, 0x10: decode_page10,
-           0x11: decode_page11, 0xB0: decode_pageB0, 0xB1: decode_pageB1}
+           0x11: decode_page11, 0x13: decode_page13, 0x14: decode_page14,
+           0xB0: decode_pageB0, 0xB1: decode_pageB1}
     for pg, fn in dec.items():
         if pg in img.pages:
             out[f"page{pg:02X}h"] = fn(img.pages[pg])

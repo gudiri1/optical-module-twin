@@ -209,6 +209,87 @@ def cmd_report(a):
     return 0
 
 
+def _sim_stimuli(m, a) -> None:
+    """Twin-only stimuli (ignored on a real module, where the lab sets them)."""
+    if not hasattr(m, "set"):
+        return
+    if getattr(a, "loss", None) is not None:
+        m.set("host_loss_db", a.loss)
+    if getattr(a, "host_prbs", None):
+        m.set("host_prbs", cmis.PATTERN_CODES[a.host_prbs])
+    if getattr(a, "far_prbs", None):
+        m.set("far_prbs", cmis.PATTERN_CODES[a.far_prbs])
+    if getattr(a, "fiber_loopback", None) is not None:
+        m.set("loopback", 1)
+        m.set("loop_atten_db", a.fiber_loopback)
+    for kv in getattr(a, "set", None) or []:
+        k, v = kv.split("=")
+        m.set(k, float(v))
+    m.run(300)
+
+
+def cmd_serdes(a):
+    m, h = _host(a)
+    _sim_stimuli(m, a)
+    if a.fixed is not None or a.adaptive:
+        st = h.set_host_eq(adaptive=a.adaptive, fixed_db=a.fixed or 0)
+        print("ApplyImmediate:", ", ".join(sorted(set(st))))
+        m.wait_ms(300)
+    print("host lane  Eq mode   CTLE dB  SNR dB  flags")
+    for x in h.host_lanes(flags=True):
+        print(f"{x['host_lane']:9d}  {'adaptive' if x['adaptive'] else 'fixed':8s} {x['eq_db']:8d} "
+              f"{x['snr_db']:7.2f}  {' '.join(x['flags']) or '-'}")
+    return 0
+
+
+def cmd_prbs(a):
+    m, h = _host(a)
+    _sim_stimuli(m, a)
+    r = h.prbs_measure(a.side, a.seconds, a.pattern, loopback=a.loopback)
+    where = f" with {a.loopback} loopback" if a.loopback else ""
+    print(f"{a.side} side {a.pattern} checker, {a.seconds:g} s{where}")
+    for i, b in enumerate(r["ber"]):
+        print(f"  lane {i + 1}: " + ("LOL (no pattern lock)" if b is None else f"BER {b:.2e}"))
+    return 1 if r["lol"] else 0
+
+
+def cmd_bench(a):
+    from .instruments import Bench
+    if a.config:
+        b = Bench.from_yaml(a.config)
+    else:
+        m, h = _host(a)
+        b = Bench.simulated(m)
+    for role, inst in b.instruments().items():
+        errs = inst.errors()
+        print(f"{role:7s} {inst.idn():32s} {'errors: ' + '; '.join(errs) if errs else 'ok'}")
+    if a.sweep:
+        b.pm.set_wavelength(1311.0)
+        print("\n case C   module C  laser C   supply W   TX1 dBm")
+        for tc in a.sweep:
+            b.forcer.set_temp(tc)
+            b.wait_s(a.soak)
+            print(f"{tc:7.1f} {b.dmm.temperature(1):9.2f} {b.dmm.temperature(2):8.2f} "
+                  f"{b.supply.power_w():9.2f} {b.pm.read_dbm(1):9.2f}")
+    if a.log:
+        b.write_log(a.log)
+        print(f"\n{len(b.log)} SCPI transactions -> {a.log}")
+    return 0
+
+
+def cmd_qual(a):
+    from . import qual
+    ok = True
+    for r in qual.run_all(quick=a.quick):
+        ok &= r.passed
+        print(f"{'PASS' if r.passed else 'FAIL'}  {r.name}")
+        for label, good, detail in r.checks:
+            print(f"   {'ok ' if good else 'BAD'} {label}" + (f"  ({detail})" if detail else ""))
+        if "life_note" in r.data:
+            print(f"   note: {r.data['life_note']}")
+    return 0 if ok else 1
+
+
 def cmd_demo(a):
     from . import demo
     demo.run(fast=a.fast)
@@ -275,6 +356,33 @@ def main(argv=None):
     s.add_argument("--units", type=int, default=40)
     s.add_argument("--role-map", metavar="YAML", help="append a requirement-to-evidence table from a YAML file")
     s.set_defaults(fn=cmd_report)
+    pats = sorted(cmis.PATTERN_CODES, key=cmis.PATTERN_CODES.get)
+    s = sub.add_parser("serdes", help="host-side lanes: CTLE, SNR, flags; set Tx input Eq")
+    s.add_argument("--adaptive", action="store_true", help="adaptive Tx input Eq (ApplyImmediate)")
+    s.add_argument("--fixed", type=int, metavar="DB", help="fixed Tx input Eq 0..12 dB (ApplyImmediate)")
+    s.add_argument("--loss", type=float, help="twin: host channel loss at Nyquist [dB]")
+    s.add_argument("--set", nargs="*", metavar="NAME=V", help="twin: further stimuli, e.g. host_los.3=1")
+    s.set_defaults(fn=cmd_serdes)
+    s = sub.add_parser("prbs", help="PRBS generator/checker BER, optional loopback (Page 13h/14h)")
+    s.add_argument("--side", choices=("host", "media"), default="media")
+    s.add_argument("--pattern", choices=pats, default="PRBS31Q")
+    s.add_argument("--seconds", type=float, default=3.0)
+    s.add_argument("--loopback", choices=sorted(cmis.LOOPBACKS))
+    s.add_argument("--loss", type=float, help="twin: host channel loss at Nyquist [dB]")
+    s.add_argument("--host-prbs", choices=pats, help="twin: pattern the switch ASIC sends")
+    s.add_argument("--far-prbs", choices=pats, help="twin: pattern arriving from the far end")
+    s.add_argument("--fiber-loopback", type=float, metavar="DB", help="twin: fiber loopback with attenuation")
+    s.add_argument("--set", nargs="*", metavar="NAME=V", help="twin: further stimuli, e.g. rx_dbm.2=-9")
+    s.set_defaults(fn=cmd_prbs)
+    s = sub.add_parser("qual", help="qualification: HTOL readpoints, temperature and power cycling, NVM wear")
+    s.add_argument("--quick", action="store_true")
+    s.set_defaults(fn=cmd_qual)
+    s = sub.add_parser("bench", help="lab instruments over SCPI: identify, optional temperature sweep")
+    s.add_argument("--config", metavar="YAML", help="real bench (see docs/lab/bench-example.yaml)")
+    s.add_argument("--sweep", type=float, nargs="*", metavar="C", help="case temperatures to step through")
+    s.add_argument("--soak", type=float, default=60, help="soak time per step [s]")
+    s.add_argument("--log", metavar="CSV", help="write the SCPI transaction log")
+    s.set_defaults(fn=cmd_bench)
     s = sub.add_parser("demo", help="scripted 6-step walkthrough")
     s.add_argument("--fast", action="store_true")
     s.set_defaults(fn=cmd_demo)

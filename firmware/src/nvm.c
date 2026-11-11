@@ -92,33 +92,109 @@ int nvm_save_calibration(struct omt_fw *fw)
 /* ------------------------------ user EEPROM ------------------------- */
 #define UEEP_MAGIC 0x50454555u /* "UEEP" */
 
+/*
+ * User EEPROM (Page 03h): append-only log over two sectors used in turn.
+ * Each save programs the next blank slot; only when a sector is full is the
+ * *other* sector erased and continued, so the newest valid copy is never
+ * inside the sector being erased (power-fail safe) and a sector is erased
+ * once per 2 x UEEP_SLOTS saves instead of on every save (findings F-010).
+ * The pre-1.1 single record at slot 0 of sector A is still read once.
+ */
+struct ueep_rec {
+	uint32_t magic;
+	uint32_t seq;
+	uint8_t data[128];
+	uint32_t crc;                 /* CRC32 over magic, seq, data        */
+};
+
+#define UEEP2_MAGIC 0x32504545u /* "EEP2" */
+#define UEEP_SLOTS  (OMT_NVM_SECTOR / sizeof(struct ueep_rec))
+
+static const uint32_t ueep_base[2] = { OMT_NVM_USER_EEPROM, OMT_NVM_USER_EEPROM_B };
+
+static uint32_t ueep_addr(uint8_t sec, uint32_t slot)
+{
+	return ueep_base[sec] + slot * (uint32_t)sizeof(struct ueep_rec);
+}
+
+static bool ueep_blank(struct omt_fw *fw, uint8_t sec, uint32_t slot)
+{
+	uint32_t w[sizeof(struct ueep_rec) / 4];
+
+	HAL(fw)->nvm_read(HAL(fw)->ctx, ueep_addr(sec, slot), w, sizeof(w));
+	for (size_t i = 0; i < sizeof(w) / 4; i++) {
+		if (w[i] != 0xFFFFFFFFu) {
+			return false;
+		}
+	}
+	return true;
+}
+
 void nvm_load_user_eeprom(struct omt_fw *fw)
 {
-	struct {
-		uint32_t magic, crc;
-		uint8_t data[128];
-	} r;
+	union {                       /* one buffer for both formats: stack */
+		struct ueep_rec r;
+		struct {
+			uint32_t magic, crc;
+			uint8_t data[128];
+		} old;
+	} u;
+	struct ueep_rec *rp = &u.r;
+	bool found = false;
 
-	HAL(fw)->nvm_read(HAL(fw)->ctx, OMT_NVM_USER_EEPROM, &r, sizeof(r));
-	if (r.magic == UEEP_MAGIC && omt_crc32(0, r.data, 128) == r.crc) {
-		memcpy(fw->m.p03, r.data, 128);
-	} else {
-		memset(fw->m.p03, 0, 128);
+	fw->ueep_sec = 0;
+	fw->ueep_slot = -1;
+	fw->ueep_seq = 0;
+	memset(fw->m.p03, 0, 128);
+	for (uint8_t s = 0; s < 2; s++) {
+		for (uint32_t i = 0; i < UEEP_SLOTS; i++) {
+			HAL(fw)->nvm_read(HAL(fw)->ctx, ueep_addr(s, i), rp, sizeof(*rp));
+			if (rp->magic != UEEP2_MAGIC ||
+			    omt_crc32(0, rp, offsetof(struct ueep_rec, crc)) != rp->crc) {
+				continue;
+			}
+			if (!found || rp->seq > fw->ueep_seq) {
+				found = true;
+				fw->ueep_seq = rp->seq;
+				fw->ueep_sec = s;
+				fw->ueep_slot = (int16_t)i;
+				memcpy(fw->m.p03, rp->data, 128);
+			}
+		}
+	}
+	if (!found) {
+		HAL(fw)->nvm_read(HAL(fw)->ctx, OMT_NVM_USER_EEPROM, &u.old, sizeof(u.old));
+		if (u.old.magic == UEEP_MAGIC && omt_crc32(0, u.old.data, 128) == u.old.crc) {
+			memcpy(fw->m.p03, u.old.data, 128);
+			fw->ueep_slot = UEEP_SLOTS; /* sector A is not a log: next save starts in B */
+		}
 	}
 }
 
 void nvm_save_user_eeprom(struct omt_fw *fw)
 {
-	struct {
-		uint32_t magic, crc;
-		uint8_t data[128];
-	} r;
+	struct ueep_rec r;
+	uint8_t sec = fw->ueep_sec;
+	uint32_t slot = (uint32_t)(fw->ueep_slot + 1);
 
-	r.magic = UEEP_MAGIC;
+	/* skip slots a power loss left half-programmed */
+	while (slot < UEEP_SLOTS && !ueep_blank(fw, sec, slot)) {
+		slot++;
+	}
+	if (slot >= UEEP_SLOTS) {
+		sec ^= 1;
+		slot = 0;
+		HAL(fw)->nvm_erase(HAL(fw)->ctx, ueep_base[sec], OMT_NVM_SECTOR);
+	}
+	r.magic = UEEP2_MAGIC;
+	r.seq = fw->ueep_seq + 1;
 	memcpy(r.data, fw->m.p03, 128);
-	r.crc = omt_crc32(0, r.data, 128);
-	HAL(fw)->nvm_erase(HAL(fw)->ctx, OMT_NVM_USER_EEPROM, OMT_NVM_SECTOR);
-	HAL(fw)->nvm_write(HAL(fw)->ctx, OMT_NVM_USER_EEPROM, &r, sizeof(r));
+	r.crc = omt_crc32(0, &r, offsetof(struct ueep_rec, crc));
+	if (HAL(fw)->nvm_write(HAL(fw)->ctx, ueep_addr(sec, slot), &r, sizeof(r)) == 0) {
+		fw->ueep_sec = sec;
+		fw->ueep_slot = (int16_t)slot;
+		fw->ueep_seq = r.seq;
+	}
 }
 
 /* ------------------------------ fault log --------------------------- */

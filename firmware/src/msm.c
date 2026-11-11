@@ -75,16 +75,20 @@ static void pwrup_sequence(struct omt_fw *fw)
 		}
 		dsp_power_up(fw);
 		tec_enable(fw, true);
+		/* sequence delays count from the rails, not from entering PwrUp:
+		 * step 0 runs one msm period after the state change, and timing
+		 * from mstate_t cut the DSP reset hold to ~10 ms (findings F-009) */
+		fw->pwrup_t0 = now;
 		fw->pwrup_step = 1;
 		break;
 	case 1:
-		if (dt >= 20) {
+		if (now - fw->pwrup_t0 >= 20) {
 			dsp_release_reset(fw);
 			fw->pwrup_step = 2;
 		}
 		break;
 	case 2:
-		if (dt >= 50) {
+		if (now - fw->pwrup_t0 >= 50) {
 			if (dsp_start(fw) < 0) {
 				msm_enter_fault(fw, FC_DSP, EV_DSP_NO_RESPONSE, 0);
 				return;

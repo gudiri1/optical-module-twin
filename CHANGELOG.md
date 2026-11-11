@@ -1,6 +1,21 @@
 # Changelog
 
 ## Unreleased
+* Host-side SerDes: 8 host lanes with adaptive or fixed Tx input CTLE through the CMIS staged/active
+  control sets (Page 10h/11h SI bytes, ApplyImmediate); Tx LOS, Tx CDR LOL and Tx adaptive Eq fault
+  per host lane (F-008)
+* CMIS diagnostics Pages 13h/14h: PRBS generators and checkers on host and media side, four loopbacks,
+  BER as F16 or SNR, latched checker LOL; console `serdes`; CLI `serdes`, `prbs`
+* Power-up sequence times the DSP reset hold from the rails, not from the state change (F-009)
+* User EEPROM as an append-only log over two sectors: wear down by ~60x, power-fail safe, old format
+  still read (F-010)
+* SCPI instrument layer (supply, thermal forcer, source + VOA, power meter, DMM, BERT, oscilloscope)
+  over VISA, TCP or simulation; environmental DVT procedures run through it; CLI `bench`
+* New DVT procedures: host channel sweep, loopback fault isolation, power sequencing on the oscilloscope
+* Qualification: HTOL readpoints with life extrapolation, temperature cycling, power cycling with NVM
+  wear projection; CLI `qual`; docs/qualification.md (EVT/DVT/PVT)
+* Report sections for host interface, bench bring-up and qualification; one-page status page
+* docs/hardware.md (nets, ADC scaling, first power-on checklist, footprint); `tools/footprint.py`
 * Build and run natively on Windows (MinGW): the host `ctypes` binding
   discovers the platform-correct `libomt_sim` name, and the Windows DLL is
   statically linked (libgcc/libstdc++/winpthread) so it loads without the

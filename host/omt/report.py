@@ -13,7 +13,8 @@ from pathlib import Path
 
 import yaml
 
-from . import __version__, dsplab, dvt, mfg
+from . import __version__, dsplab, dvt, mfg, qual
+from . import status as status_page
 
 ROOT = Path(__file__).resolve().parents[2]
 E = html.escape
@@ -330,12 +331,35 @@ def _table(head, rows, num_cols=()):
     return f'<div class="tblwrap"><table><thead><tr>{h}</tr></thead><tbody>{body}</tbody></table></div>'
 
 
+def _footprint() -> dict | None:
+    """Cortex-M4F footprint: measure if the ARM toolchain is there, else reuse build/footprint.json."""
+    import importlib.util
+    import shutil
+    if shutil.which("arm-none-eabi-gcc"):
+        spec = importlib.util.spec_from_file_location("footprint", ROOT / "tools" / "footprint.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        fp = mod.measure()
+        (ROOT / "build").mkdir(exist_ok=True)
+        (ROOT / "build" / "footprint.json").write_text(json.dumps(fp, indent=1))
+        return fp
+    p = ROOT / "build" / "footprint.json"
+    return json.loads(p.read_text()) if p.exists() else None
+
+
 def generate(out: str = "build/report.html", quick: bool = False, units: int = 40,
              role_map: str | None = None) -> str:
-    """role_map: optional YAML list of {requirement, evidence} appended as a section."""
+    """role_map: optional YAML list of {requirement, evidence} appended as a section.
+    Also writes status.html (one-page summary) next to `out`."""
     now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
     res = dvt.run_all(quick=quick)
     by = {r.name: r for r in res}
+    host_si = next(r for r in res if r.name.startswith("Host interface: channel loss sweep"))
+    iso = by["Fault isolation with PRBS and loopbacks"]
+    scope = by["Power-up sequencing on the oscilloscope"]
+    qres = qual.run_all(quick=quick)
+    htol, tcyc, pcyc = qres
+    fp = _footprint()
     sweep = by["Temperature sweep -5..75 degC case"]
     sens = by["Receiver sensitivity (pre-FEC BER waterfall)"]
     timing = by["Power-up and data-path timing"]
@@ -344,6 +368,7 @@ def generate(out: str = "build/report.html", quick: bool = False, units: int = 4
     fault_res = res[4:16]
     fw_res = [r for r in res if "image" in r.name.lower() or "firmware update" in r.name.lower()]
     other = [r for r in res if r.name in env_names or r.name.startswith("Host interface fuzz")]
+    new_res = [host_si, iso, scope]
     lot = mfg.run_lot(n=units)
     dsp_rows = dsplab.sweep(n_sym=50000 if quick else 80000)
     det = dsplab.link_ber(14, 50000, return_detail=True)
@@ -355,6 +380,7 @@ def generate(out: str = "build/report.html", quick: bool = False, units: int = 4
     n_checks = sum(len(r.checks) for r in res)
     n_pass_checks = sum(sum(c[1] for c in r.checks) for r in res)
     n_proc_pass = sum(r.passed for r in res)
+    n_qual = sum(r.passed for r in qres)
     min_cpk = min(s["cpk_post"] for s in lot["stats"].values())
     max_pw = max(row["power_w"] for row in sweep.data["rows"])
     covered = sum(1 for r in reqs if trace.get(r["id"]) or r.get("unit"))
@@ -388,6 +414,35 @@ def generate(out: str = "build/report.html", quick: bool = False, units: int = 4
                   ymin=1e-20, ymax=1) \
         .add("t = 15", [(b, max(dsplab.kp4_cw_failure(b), 1e-30)) for b in fec_x], 1, markers=False) \
         .ref(dsplab.kp4_cw_failure(2.4e-4), "at 2.4e-4")
+    hr = host_si.data["rows"]
+    c_hsnr = Chart("hsnr", "host channel loss at Nyquist [dB]", "host lane SNR after CTLE [dB]", yfmt="{:.0f}",
+                   ymin=0, ymax=30) \
+        .add("adaptive CTLE", [(x["loss_db"], x["snr_db"]) for x in hr if x["mode"] == "adaptive"], 1) \
+        .add("fixed 0 dB", [(x["loss_db"], x["snr_db"]) for x in hr if x["mode"] != "adaptive"], 2) \
+        .ref(15.0, "CDR lock")
+    c_hber = Chart("hber", "host channel loss at Nyquist [dB]", "PRBS31Q BER (worst of 8 lanes)", logy=True,
+                   yfmt="{:.1e}", ymin=1e-10, ymax=1) \
+        .add("adaptive CTLE", [(x["loss_db"], x["ber"]) for x in hr if x["mode"] == "adaptive" and x["ber"]], 1) \
+        .add("fixed 0 dB", [(x["loss_db"], x["ber"]) for x in hr if x["mode"] != "adaptive" and x["ber"]], 2) \
+        .ref(dvt.LIM["host_ber"], "C2M target")
+    wf, trig, sdt = scope.data["waveforms"], scope.data["trig"], scope.data["dt"]
+    lab = {"rail_tx_v": "laser driver rail", "rail_dsp_v": "DSP core rail", "pin.dsp_rstn": "DSP_RSTN",
+           "pin.intl": "IntL"}
+
+    def wave(net, i0, i1, step=1):
+        return [((i - trig) * sdt * 1000, wf[net][i]) for i in range(max(0, i0), min(len(wf[net]), i1), step)]
+    c_seq = Chart("seq", "time from trigger [ms]", "volts", yfmt="{:.1f}", xfmt="{:g}", ymin=0, ymax=3.5)
+    for slot, net in enumerate(("rail_tx_v", "rail_dsp_v", "pin.dsp_rstn"), 1):
+        c_seq.add(lab[net], wave(net, trig - 10, trig + 60), slot, markers=False)
+    c_full = Chart("full", "time from trigger [ms]", "volts", yfmt="{:.1f}", xfmt="{:g}", ymin=0, ymax=3.5)
+    for slot, net in enumerate(("rail_tx_v", "rail_dsp_v", "pin.dsp_rstn", "pin.intl"), 1):
+        c_full.add(lab[net], wave(net, 0, len(wf[net]), 5), slot, markers=False)
+    hrows = htol.data["rows"]
+    c_htol = Chart("htol", "use-equivalent age [years]", "operating bias [mA]", yfmt="{:.0f}", xfmt="{:.1f}",
+                   ymin=50, ymax=100)
+    for i in range(4):
+        c_htol.add(f"lane {i + 1}", [(x["use_years"], x["bias_ma"][i]) for x in hrows], i + 1)
+    c_htol.ref(90.0, "bias warning")
     keys = list(lot["stats"])
     c_cpk = bars("cpk", ["temp", "Vcc", "RX DDM", "TX DDM", "TX abs"],
                  [("before calibration", 2, [lot["stats"][k]["cpk_pre"] for k in keys]),
@@ -425,8 +480,34 @@ def generate(out: str = "build/report.html", quick: bool = False, units: int = 4
     rows = yaml.safe_load(Path(role_map).read_text()) if role_map else []
     job_tbl = _table(["Requirement", "Where it is demonstrated"],
                      [[E(r["requirement"]), E(r["evidence"])] for r in rows])
-    role_html = (f'<section><div class="sechead"><span class="secno">8</span><h2>Requirement coverage</h2></div>'
+    role_html = (f'<section><div class="sechead"><span class="secno">11</span><h2>Requirement coverage</h2></div>'
                  f"{job_tbl}</section>") if role_map else ""
+    host_tbl = _table(["Eq", "loss dB", "CTLE dB", "SNR dB", "worst BER", "lanes LOL", "adaptive Eq fault"],
+                      [[x["mode"], f"{x['loss_db']:g}", str(x["eq_db"]), f"{x['snr_db']:.1f}",
+                        "LOL" if x["ber"] is None else f"{x['ber']:.1e}", str(x["lol_lanes"]),
+                        f"0x{x['adapt_fault']:02X}"] for x in hr], range(1, 6))
+    htol_tbl = _table(["stress h", "use years", "bias L1 mA", "L2", "L3", "L4", "TX L1 dBm (meter)"],
+                      [[str(x["hours"]), f"{x['use_years']:.2f}"] + [f"{b:.1f}" for b in x["bias_ma"]]
+                       + [f"{x['tx_true_dbm'][0]:.2f}"] for x in hrows], range(7))
+    life_tbl = _table(["lane", "k (unit spread)", "predicted to 90 mA [y]", "twin crossing [y]",
+                       "EOL shutdown [y]", "warning lead [y]"],
+                      [[str(i + 1), f"{htol.data['k'][i]:.2f}", f"{htol.data['pred_years'][i]:.1f}",
+                        f"{htol.data['true_years'][i]:.1f}", f"{htol.data['eol_years'][i]:.1f}",
+                        f"{htol.data['warn_lead_years'][i]:.1f}"] for i in range(4)], range(6))
+    wear_tbl = _table(["user EEPROM writes", "per year", "years to 100k erases"],
+                      [[e["writes"], f"{e['per_year']:,}", f"{e['years']:,.0f}"]
+                       for e in pcyc.data["eeprom_profile"]], (1, 2))
+    if fp:
+        fp_tbl = _table(["module", "flash B", "RAM B"],
+                        [[E(k), str(v["flash"]), str(v["ram"])] for k, v in fp["modules"].items()], (1, 2))
+        fp_html = (f'<p>Firmware cross-compiled unchanged for a {E(fp["cpu"])} (arm-none-eabi-gcc {E(fp["gcc"])},'
+                   f' -Os, hard float), linked with newlib-nano and a stub board: <b>{fp["flash_bytes"] / 1024:.1f} KiB'
+                   f' flash, {fp["ram_bytes"] / 1024:.1f} KiB RAM</b>, of which {fp["fw_state_bytes"]} B are the'
+                   f' firmware state. Largest stack frame {fp["stack_top"][0]["bytes"]} B'
+                   f' ({E(fp["stack_top"][0]["function"])}). <span class="mono">tools/footprint.py</span></p>{fp_tbl}')
+    else:
+        fp_html = "<p>Footprint: run <span class=mono>python tools/footprint.py --json build/footprint.json</span>" \
+                  " with the GNU Arm toolchain on PATH.</p>"
     find_html = "".join(
         f'<div class="find"><div class="id">{E(f["id"])} &middot; {E(f["status"])}</div><h3>{E(f["title"])}</h3>'
         f'<p><b>Found by</b> {E(f["found_by"])}. {E(f["root_cause"])}</p><p><b>Action</b> {E(f["fix"])}</p></div>'
@@ -452,6 +533,10 @@ def generate(out: str = "build/report.html", quick: bool = False, units: int = 4
   <div class="stat"><b>{min_cpk:.2f}</b><span>lowest Cpk after calibration</span></div>
   <div class="stat"><b>{covered}/{len(reqs)}</b><span>requirements with tests</span></div>
   <div class="stat"><b>{sum(r.passed for r in fault_res)}/{len(fault_res)}</b><span>fault scenarios handled</span></div>
+  <div class="stat"><b>{host_si.data['reach_adaptive_db']} dB</b><span>host channel loss at BER 2.4e-4</span></div>
+  <div class="stat"><b>{scope.data['reset_hold_ms']} ms</b><span>DSP reset hold on the scope</span></div>
+  <div class="stat"><b>{n_qual}/{len(qres)}</b><span>qualification procedures passed</span></div>
+  <div class="stat"><b>{(f"{fp['flash_bytes'] / 1024:.1f} KiB") if fp else "n/a"}</b><span>flash on Cortex-M4F</span></div>
 </div>
 
 <section><div class="sechead"><span class="secno">1</span><h2>Receiver and DSP</h2></div>
@@ -486,19 +571,53 @@ case; heating is cheaper than cooling, so the hot corner uses {max(r['tec_pct'] 
 {_results_block(other)}
 </section>
 
-<section><div class="sechead"><span class="secno">3</span><h2>Fault injection and root cause</h2></div>
+<section><div class="sechead"><span class="secno">3</span><h2>Host interface and PRBS diagnostics</h2></div>
+<p>The module's 8 host input lanes (400GAUI-8) equalize the host channel with a CTLE, adaptive or fixed through
+the CMIS staged control set. The switch ASIC (a BERT on the bench) sends PRBS31Q; the module's own checkers
+(Page 13h/14h) measure the BER per lane.</p>
+<div class="grid2">
+<figure>{c_hsnr.svg()}<figcaption><b>Host lane SNR vs channel loss.</b> Adaptive peaking follows the loss up to
+the 12&nbsp;dB CTLE limit; fixed 0&nbsp;dB loses 1.2&nbsp;dB of SNR per dB of loss. Below 15&nbsp;dB the host CDR
+does not lock and the Tx adaptive Eq fault flag latches.</figcaption></figure>
+<figure>{c_hber.svg()}<figcaption><b>PRBS31Q BER from the module's checkers.</b> Points with no errors in the
+dwell are not drawn. Reach at BER 2.4e-4: {host_si.data['reach_adaptive_db']}&nbsp;dB adaptive,
+{host_si.data['reach_fixed_db']}&nbsp;dB fixed.</figcaption></figure>
+</div>
+{host_tbl}
+{_results_block(new_res[:2])}
+</section>
+
+<section><div class="sechead"><span class="secno">4</span><h2>Bring-up on the bench</h2></div>
+<p>The environmental procedures and this capture drive instruments over SCPI (supply, thermal forcer, source and
+VOA, power meter, DMM, BERT, oscilloscope). On the simulated bench they act on the twin; pointed at a YAML file
+with VISA or socket resources the same code drives a real bench. Every transaction is time-stamped in the test
+record.</p>
+<div class="grid2">
+<figure>{c_seq.svg()}<figcaption><b>Power-up sequence, first 60&nbsp;ms.</b> Trigger on the laser-driver rail;
+the DSP core rail is in regulation after {scope.data['t_dsp_ok_ms']:.0f}&nbsp;ms and the DSP reset is released
+{scope.data['reset_hold_ms']}&nbsp;ms after its rail (spec 20&nbsp;ms, 1&nbsp;ms sampling). The first version of
+this capture showed 9&nbsp;ms: finding F-009.</figcaption></figure>
+<figure>{c_full.svg()}<figcaption><b>Whole ModulePwrUp.</b> IntL falls at {scope.data['t_intl_ms']:.0f}&nbsp;ms
+when the module reaches Ready and latches ModuleStateChanged.</figcaption></figure>
+</div>
+{_results_block(new_res[2:])}
+<h3>Resource use on the target</h3>
+{fp_html}
+</section>
+
+<section><div class="sechead"><span class="secno">5</span><h2>Fault injection and root cause</h2></div>
 <p>Each scenario starts from a fresh, brought-up module, injects one fault in the twin and checks what the
 host can observe: module state, fault cause, latched flags, IntL, and the firmware's non-volatile fault log.</p>
 {_results_block(fault_res)}
 </section>
 
-<section><div class="sechead"><span class="secno">4</span><h2>Firmware management (CDB)</h2></div>
+<section><div class="sechead"><span class="secno">6</span><h2>Firmware management (CDB)</h2></div>
 <p>Images are downloaded with CMIS CDB into the inactive bank, CRC-checked, run on trial and committed.
 A boot that never confirms (watchdog) rolls back to the committed bank.</p>
 {_results_block(fw_res)}
 </section>
 
-<section><div class="sechead"><span class="secno">5</span><h2>Manufacturing calibration</h2></div>
+<section><div class="sechead"><span class="secno">7</span><h2>Manufacturing calibration</h2></div>
 <div class="grid2">
 <figure>{c_cpk}<figcaption><b>Process capability, {units} units.</b> Uncalibrated units scatter with
 part-to-part spread of sensors, TIA gain and monitor photodiodes. After calibration the remaining error is set
@@ -514,13 +633,30 @@ Yield {lot['yield'] * 100:.0f}&nbsp;%.</p></div></figure>
 {cpk_tbl}
 </section>
 
-<section><div class="sechead"><span class="secno">6</span><h2>Findings</h2></div>
+<section><div class="sechead"><span class="secno">8</span><h2>Qualification</h2></div>
+<p>Reliability procedures in virtual time (docs/qualification.md lists what needs hardware). The laser aging law
+is an assumption (Ea 0.7&nbsp;eV, square-root law, AF {htol.data['af']:.1f}); the pass criteria cover the
+firmware's part: launch power held, bias warning well before end-of-life shutdown, and a life prediction from
+2000&nbsp;h readpoints that matches where the twin's laser actually crosses.</p>
+<div class="grid2">
+<figure>{c_htol.svg()}<figcaption><b>HTOL readpoints.</b> Operating bias rises as the lasers age while the APC
+holds launch power. {E(htol.data['life_note'][:1].upper() + htol.data['life_note'][1:])}.</figcaption></figure>
+<figure><div class="tblwrap" style="padding:12px 14px;display:grid;gap:8px"><h3>NVM wear</h3>
+<p>Boot record: {pcyc.data['erases_per_boot']:.4f} erases per power cycle. User EEPROM after F-010:
+{pcyc.data['erases_per_eeprom_burst']:.4f} erases per sector per host write (was 1.0).</p></div>{wear_tbl}</figure>
+</div>
+{htol_tbl}
+{life_tbl}
+{_results_block(qres)}
+</section>
+
+<section><div class="sechead"><span class="secno">9</span><h2>Findings</h2></div>
 <p>Issues found by the tests and tools while building this firmware, including review notes for the
 host-side Zephyr driver in PR #123842 (P-1 to P-4), obtained by replaying its I2C access pattern against the twin. Fixes for P-1 to P-3 are prepared for the PR and pass twister on native_sim.</p>
 <div class="finds">{find_html}</div>
 </section>
 
-<section><div class="sechead"><span class="secno">7</span><h2>Requirements traceability</h2></div>
+<section><div class="sechead"><span class="secno">10</span><h2>Requirements traceability</h2></div>
 <p>{"From the last pytest run (build/trace.json)." if trace else "Run pytest first to fill in the test column."}</p>
 {req_tbl}
 </section>
@@ -538,5 +674,22 @@ checked against the OIF-CMIS text before product use. Generated by <span class="
             f"<style>{CSS}</style>\n</head>\n<body>\n{body}\n<script>{JS}</script>\n</body>\n</html>\n")
     p = Path(out)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(page)
+    p.write_text(page, encoding="utf-8")
+    facts = {
+        "generated": now, "quick": quick, "units": units,
+        "dvt": {"checks": n_checks, "checks_passed": n_pass_checks, "procedures": len(res),
+                "procedures_passed": n_proc_pass, "failed": [r.name for r in res if not r.passed]},
+        "faults": {"passed": sum(r.passed for r in fault_res), "total": len(fault_res)},
+        "sensitivity_dbm": sens.data["sensitivity_dbm"], "pwrup_ms": timing.data["pwrup_ms"],
+        "dpinit_ms": timing.data["dpinit_ms"], "max_power_w": max_pw, "min_cpk": min_cpk,
+        "yield": lot["yield"], "host_reach_db": host_si.data["reach_adaptive_db"],
+        "reset_hold_ms": scope.data["reset_hold_ms"],
+        "qual": [{"name": r.name, "passed": r.passed} for r in qres], "life_note": htol.data["life_note"],
+        "warn_lead_min_y": min(htol.data["warn_lead_years"]),
+        "eeprom_hourly_years": pcyc.data["eeprom_profile"][1]["years"],
+        "footprint": None if not fp else {"flash": fp["flash_bytes"], "ram": fp["ram_bytes"], "cpu": fp["cpu"]},
+        "requirements": {"total": len(reqs), "covered": covered},
+        "findings": finds, "fw_res_passed": all(r.passed for r in fw_res),
+    }
+    status_page.write(p.with_name("status.html"), facts)
     return str(p)

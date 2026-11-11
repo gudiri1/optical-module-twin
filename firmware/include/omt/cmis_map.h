@@ -111,7 +111,10 @@ enum cmis_cfg_status {
 #define P01_HW_REV_MINOR          131
 #define P01_WAVELENGTH            138  /* U16, 0.05 nm */
 #define P01_WAVELENGTH_TOL        140  /* U16, 0.005 nm */
-#define P01_PAGES_SUPPORTED       142
+#define P01_PAGES_SUPPORTED       142  /* b2 page 03h, b5 pages 13h-14h */
+#define P01_SI_MAX_EQ             153  /* b3..0 max Tx input Eq dB (this design: 12) */
+#define P01_SI_TX_CAP             161  /* b0 Tx CDR, b2 fixed Tx input Eq, b3 adaptive Tx input Eq */
+#define P01_SI_RX_CAP             162  /* b0 Rx CDR, b2 amplitude, b4 pre-, b5 post-cursor */
 #define P01_DUR_DP                144  /* bits3..0 DPInit, bits7..4 DPDeinit */
 #define P01_MOD_MON_SUPPORT       159  /* b0 temp b1 vcc b2 aux1 b3 aux2 */
 #define P01_LANE_MON_SUPPORT      160  /* b0 bias b1 txpwr b2 rxpwr, b4..3 bias scale */
@@ -140,6 +143,16 @@ enum cmis_cfg_status {
 #define P10_APPLY_DPINIT          143
 #define P10_APPLY_IMMEDIATE       144
 #define P10_DPCONFIG              145  /* 8 bytes: AppSel<<4 | DPID<<1 | Explicit */
+/* Staged control set 0, host-side signal integrity (follows DPConfig) */
+#define P10_SI_ADAPT_EQ           153  /* Tx input adaptive Eq enable, bit per host lane */
+#define P10_SI_ADAPT_RECALL       154  /* 2 bytes, not implemented (reads 0) */
+#define P10_SI_TX_EQ              156  /* 4 bytes, nibble per host lane: fixed Tx input Eq, dB */
+#define P10_SI_TX_CDR             160  /* Tx CDR enable, bit per host lane */
+#define P10_SI_RX_CDR             161  /* Rx CDR enable, bit per host lane */
+#define P10_SI_RX_PRE             162  /* 4 bytes, nibble per host lane: Rx output pre-cursor */
+#define P10_SI_RX_POST            166  /* 4 bytes: Rx output post-cursor */
+#define P10_SI_RX_AMP             170  /* 4 bytes: Rx output amplitude code */
+#define P10_SI_LAST               173
 #define P10_MASK_BASE             213  /* masks for Page 11h flags 134..152 */
 
 /* ---------------- Page 11h (lane status, bank 0) ---------------- */
@@ -172,6 +185,63 @@ enum cmis_cfg_status {
 #define P11_MON_RXPWR             186  /* 8 x U16, 0.1 uW */
 #define P11_CFG_STATUS            202  /* 4 bytes, nibble per lane */
 #define P11_ACTIVE_DPCONFIG       206  /* 8 bytes */
+#define P11_SI_ADAPT_EQ           214  /* active control set: Page 10h 153..173 + 61 */
+#define P11_SI_TX_EQ              217
+#define P11_SI_TX_CDR             221
+#define P11_SI_RX_CDR             222
+#define P11_SI_RX_PRE             223
+#define P11_SI_RX_POST            227
+#define P11_SI_RX_AMP             231
+#define P11_SI_OFFSET             (P11_SI_ADAPT_EQ - P10_SI_ADAPT_EQ)
+
+/* ---------------- Page 13h (diagnostic capabilities + controls, bank 0) --- */
+#define P13_LOOPBACK_CAP          128  /* b0 media out, b1 media in, b2 host out, b3 host in,
+                                        * b5 per-lane media, b6 per-lane host */
+#define P13_PATTERN_CAP           129  /* b0 gating, b7 checker LOL reported */
+#define P13_REPORT_CAP            130  /* b0 BER, b5 SNR */
+#define P13_HOST_GEN_PATTERNS     132  /* U16, bit n = pattern n supported */
+#define P13_MEDIA_GEN_PATTERNS    134
+#define P13_HOST_CHK_PATTERNS     136
+#define P13_MEDIA_CHK_PATTERNS    138
+#define P13_HOST_GEN_EN           144  /* bit per host lane */
+#define P13_HOST_GEN_PAT          148  /* 4 bytes, nibble per host lane */
+#define P13_MEDIA_GEN_EN          152  /* bit per media lane */
+#define P13_MEDIA_GEN_PAT         156  /* 4 bytes, nibble per lane */
+#define P13_HOST_CHK_EN           160
+#define P13_HOST_CHK_PAT          164
+#define P13_MEDIA_CHK_EN          168
+#define P13_MEDIA_CHK_PAT         172
+#define P13_DIAG_CTRL             177  /* b7 reset error counters (self-clearing) */
+#define P13_LB_MEDIA_OUT          180  /* media side output loopback, bit per media lane */
+#define P13_LB_MEDIA_IN           181  /* media side input loopback */
+#define P13_LB_HOST_OUT           182  /* host side output loopback, bit per host lane */
+#define P13_LB_HOST_IN            183  /* host side input loopback */
+#define P13_CTRL_FIRST            P13_HOST_GEN_EN
+#define P13_CTRL_LAST             P13_LB_HOST_IN
+
+/* PRBS pattern codes (Page 13h pattern select nibbles) */
+enum cmis_pattern {
+	CMIS_PAT_PRBS31Q = 0, CMIS_PAT_PRBS31 = 1, CMIS_PAT_PRBS23Q = 2, CMIS_PAT_PRBS23 = 3,
+	CMIS_PAT_PRBS15Q = 4, CMIS_PAT_PRBS15 = 5, CMIS_PAT_PRBS13Q = 6, CMIS_PAT_PRBS13 = 7,
+	CMIS_PAT_PRBS9Q = 8, CMIS_PAT_PRBS9 = 9, CMIS_PAT_PRBS7Q = 10, CMIS_PAT_PRBS7 = 11,
+	CMIS_PAT_SSPRQ = 12,
+};
+#define OMT_PATTERNS_SUPPORTED \
+	((1u << CMIS_PAT_PRBS31Q) | (1u << CMIS_PAT_PRBS15Q) | (1u << CMIS_PAT_PRBS13Q) | \
+	 (1u << CMIS_PAT_PRBS9Q) | (1u << CMIS_PAT_PRBS7Q) | (1u << CMIS_PAT_SSPRQ))
+
+/* ---------------- Page 14h (diagnostic results + flags, bank 0) ------------ */
+#define P14_SELECTOR              128  /* 1 = BER, 6 = SNR; selects content of 192..223 */
+#define   P14_SEL_BER               0x01
+#define   P14_SEL_SNR               0x06
+#define P14_FLAG_HOST_GEN_LOL     134  /* latched, COR */
+#define P14_FLAG_MEDIA_GEN_LOL    135
+#define P14_FLAG_HOST_CHK_LOL     136
+#define P14_FLAG_MEDIA_CHK_LOL    137
+#define P14_FLAG_FIRST            P14_FLAG_HOST_GEN_LOL
+#define P14_FLAG_LAST             P14_FLAG_MEDIA_CHK_LOL
+#define P14_RESULT_HOST           192  /* 8 x U16: BER as F16, or SNR 1/256 dB */
+#define P14_RESULT_MEDIA          208  /* 4 x U16 */
 
 /* ---------------- Page 9Fh (CDB, LPL) ---------------- */
 #define P9F_CMD                   128  /* U16 */
@@ -203,6 +273,8 @@ enum cmis_cfg_status {
 #define PB0_APC_STATE             202  /* bit per lane: converged */
 #define PB0_DSP_TEMP              204  /* S16 0.1 degC */
 #define PB0_LAST_FAULT            206  /* U16 fault code */
+#define PB0_HOST_SNR              208  /* 8 x U16, host input SNR 0.01 dB */
+#define PB0_HOST_EQ               224  /* 8 x U8, applied Tx input CTLE peaking dB */
 
 #define PB1_RAW_TEMP              128  /* U16 raw ADC */
 #define PB1_RAW_VCC               130

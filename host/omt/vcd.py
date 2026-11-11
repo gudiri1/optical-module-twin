@@ -10,6 +10,30 @@ from __future__ import annotations
 HALF_NS = 1250  # half bit period at 400 kHz
 
 
+def write_waveforms(path: str, dt_s: float, waves: dict[str, list[float]], t0_index: int = 0) -> None:
+    """Scope capture to VCD: one `real` variable per channel (GTKWave shows
+    them as analog traces; PulseView imports them as analog channels).
+    VCD time starts at the first sample (it cannot be negative); the
+    trigger is at t0_index * dt_s and is marked by a `trigger` wire."""
+    ids = {name: chr(33 + i) for i, name in enumerate(waves)}
+    n = min(len(v) for v in waves.values())
+    lines = ["$timescale 1 us $end", "$scope module omt $end"]
+    lines += [f"$var real 64 {ids[k]} {k.replace('.', '_')} $end" for k in waves]
+    lines += ["$var wire 1 ~ trigger $end", "$upscope $end", "$enddefinitions $end"]
+    last: dict[str, float | None] = {k: None for k in waves}
+    for i in range(n):
+        ch = [(k, waves[k][i]) for k in waves if waves[k][i] != last[k]]
+        if ch or i in (0, t0_index):
+            lines.append(f"#{int(round(i * dt_s * 1e6))}")
+            if i in (0, t0_index):
+                lines.append(f"{1 if i == t0_index else 0}~")
+            for k, v in ch:
+                lines.append(f"r{v:.6g} {ids[k]}")
+                last[k] = v
+    with open(path, "w", newline="\n") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 class _Wave:
     def __init__(self):
         self.ev: list[tuple[int, str, str]] = []  # (t_ns, signal, value)

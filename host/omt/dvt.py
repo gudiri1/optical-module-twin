@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Design verification test (DVT) procedures.
 
-Each procedure drives the module like a lab would (environmental chamber,
-programmable supply, variable optical attenuator, reference power meter =
-the twin's ground truth) and returns measured data plus pass/fail against
-explicit limits. Used by pytest (tests/dvt) and by the HTML report.
+Each procedure drives the module like a lab would and returns measured data
+plus pass/fail against explicit limits. The environmental procedures work
+through a :class:`omt.instruments.Bench` (thermal forcer, programmable
+supply, calibrated source + VOA, power meter, DMM with thermocouples) over
+SCPI: on the simulated bench the instruments act on the twin, on a real
+bench they are the lab's instruments. Used by pytest and the HTML report.
 """
 from __future__ import annotations
 
@@ -14,6 +16,7 @@ from dataclasses import dataclass, field
 
 from . import cmis, image
 from .host import CmisHost
+from .instruments import Bench
 from .sim import SimModule
 
 # --- acceptance limits (internal DVT spec; SFF/CMIS DDM accuracy is looser) ---
@@ -27,6 +30,8 @@ LIM = {
     "max_power_w": 10.0,        # advertised power class
     "ber_nominal": 1e-6,        # pre-FEC BER at -3 dBm
     "sensitivity_dbm": -6.0,    # avg RX power at KP4 threshold must be below this
+    "host_loss_db": 14,         # host channel loss at Nyquist the module input must equalize
+    "host_ber": 1e-5,           # module input BER target (400GAUI-8 C2M)
 }
 
 
@@ -46,6 +51,11 @@ class Result:
 def fresh(seed=1, **kw) -> tuple[SimModule, CmisHost]:
     m = SimModule(seed=seed, **kw)
     return m, CmisHost(m)
+
+
+def fresh_bench(seed=1, **kw) -> tuple[SimModule, CmisHost, Bench]:
+    m, h = fresh(seed, **kw)
+    return m, h, Bench.simulated(m)
 
 
 def db(a, b):
@@ -69,30 +79,91 @@ def power_up_timing(seed=1) -> Result:
     return r
 
 
+def _first(series, cond, start=0):
+    return next((i for i in range(start, len(series)) if cond(series[i])), None)
+
+
+def power_sequencing_scope(seed=1) -> Result:
+    """Bring-up view on the oscilloscope: laser-driver rail, DSP core rail,
+    DSP reset and IntL while the host releases LowPwr (docs/bringup.md)."""
+    m, h, bench = fresh_bench(seed)
+    r = Result("Power-up sequencing on the oscilloscope", True)
+    h.wait(lambda: h._probe(), 2000, 5)
+    h.read_flags()                               # IntL released before the capture
+    s = bench.scope
+    nets = {1: "rail_tx_v", 2: "rail_dsp_v", 3: "pin.dsp_rstn", 4: "pin.intl"}
+    for ch, net in nets.items():
+        s.probe(ch, net)
+    s.setup(0.1, trig_ch=1, level_v=1.65)        # 100 ms/div, trigger on the TX rail rising
+    s.single()
+    bench.wait_s(0.05)
+    h.write(26, 0x00)                            # host clears LowPwrRequestSW / AllowRequestHW
+    bench.wait_s(1.2)
+    r.check("scope triggered on the laser-driver rail", s.triggered())
+    if not s.triggered():
+        return r
+    dt, tx = s.waveform(1)
+    wf = {nets[1]: tx}
+    for ch in (2, 3, 4):
+        wf[nets[ch]] = s.waveform(ch)[1]
+    trig = int(round(-s.pretrigger_s() / dt))
+
+    def t_ms(i):
+        return None if i is None else (i - trig) * dt * 1000
+
+    i_on = _first(wf["rail_dsp_v"], lambda v: v >= 0.1 * 0.75)
+    i_dsp = _first(wf["rail_dsp_v"], lambda v: v >= 0.9 * 0.75)
+    i_rst = _first(wf["pin.dsp_rstn"], lambda v: v > 1.65)
+    i_int = _first(wf["pin.intl"], lambda v: v < 1.65, trig)
+    rst_edges = sum(1 for a, b in zip(wf["pin.dsp_rstn"], wf["pin.dsp_rstn"][1:]) if a < 1.65 <= b)
+    dsp_dip = any(b < a - 0.02 for a, b in zip(wf["rail_dsp_v"][trig:], wf["rail_dsp_v"][trig + 1:]))
+    r.data.update(dt=dt, trig=trig, waveforms=wf, t_dsp_ok_ms=t_ms(i_dsp), t_reset_release_ms=t_ms(i_rst),
+                  t_intl_ms=t_ms(i_int))
+    r.check("DSP core rail in regulation within 5 ms of the laser-driver rail",
+            i_dsp is not None and t_ms(i_dsp) <= 5, f"{t_ms(i_dsp)} ms")
+    gap = None if i_rst is None or i_on is None else round(t_ms(i_rst) - t_ms(i_on))
+    r.data["reset_hold_ms"] = gap
+    # bring-up spec: release 20 ms after rails on; 1 ms sample resolution
+    r.check("DSP reset held >= 20 ms after its rail switches on (1 ms resolution)",
+            gap is not None and 19 <= gap <= 35, f"{gap} ms")
+    r.check("exactly one reset release, rail monotonic", rst_edges == 1 and not dsp_dip,
+            f"{rst_edges} edges, dip={dsp_dip}")
+    r.check("IntL asserts when the module reaches Ready, after reset release",
+            i_int is not None and i_rst is not None and i_int > i_rst and t_ms(i_int) < 5000,
+            f"IntL at {t_ms(i_int)} ms")
+    return r
+
+
 # ---------------------------------------------------------------- environment
 
-def temp_sweep(seed=1, temps=(-5, 0, 15, 25, 40, 55, 70, 75), settle_s=100) -> Result:
-    m, h = fresh(seed)
+def temp_sweep(seed=1, temps=(-5, 0, 15, 25, 40, 55, 70, 75), settle_s=100, bench: Bench | None = None,
+               host: CmisHost | None = None) -> Result:
+    if bench is None:
+        m, h, bench = fresh_bench(seed)
+    else:
+        h = host
     h.bring_up()
     r = Result("Temperature sweep -5..75 degC case", True)
+    bench.pm.set_wavelength(1311.0)
     rows = []
     ref_tx = None
     for tc in temps:
         h.read_flags()                 # clear, then capture what this step latches
-        m.set("case_temp", tc)
-        m.run(settle_s * 1000)
+        bench.forcer.set_temp(tc)
+        bench.wait_s(settle_s)
         fl = h.read_flags()            # COR: flags before the lower-memory read
         lo = cmis.decode_lower(h.lower())
         p11 = cmis.decode_page11(h.upper(0x11))
         b0 = cmis.decode_pageB0(h.upper(0xB0))
-        row = {"case_c": tc, "ddm_temp": lo["temperature_c"], "true_temp": m.get("module_temp"),
-               "ddm_vcc": lo["vcc_v"], "laser_c": m.get("laser_temp"), "tec_pct": lo["tec_drive_pct"],
-               "power_w": m.get("power_w"), "ber": max(b0["prefec_ber"])}
+        rx_ref = bench.voa.output_dbm()
+        row = {"case_c": tc, "ddm_temp": lo["temperature_c"], "true_temp": bench.dmm.temperature(1),
+               "ddm_vcc": lo["vcc_v"], "laser_c": bench.dmm.temperature(2), "tec_pct": lo["tec_drive_pct"],
+               "power_w": bench.supply.power_w(), "ber": max(b0["prefec_ber"])}
         for i in range(4):
             row[f"tx_ddm_dbm{i}"] = p11["lanes"][i]["tx_power_dbm"]
-            row[f"tx_true_dbm{i}"] = m.get(f"tx_dbm.{i}")
+            row[f"tx_true_dbm{i}"] = bench.pm.read_dbm(i + 1)
             row[f"rx_ddm_dbm{i}"] = p11["lanes"][i]["rx_power_dbm"]
-            row[f"rx_true_dbm{i}"] = m.get(f"rx_dbm.{i}")
+            row[f"rx_true_dbm{i}"] = rx_ref
             row[f"bias_ma{i}"] = p11["lanes"][i]["tx_bias_ma"]
         row["temp_flags"] = fl["temp_vcc"] & 0x0F
         rows.append(row)
@@ -124,22 +195,23 @@ def temp_sweep(seed=1, temps=(-5, 0, 15, 25, 40, 55, 70, 75), settle_s=100) -> R
 
 
 def vcc_margin(seed=1, levels=(2.95, 3.10, 3.15, 3.30, 3.45, 3.50, 3.70)) -> Result:
-    m, h = fresh(seed)
+    m, h, bench = fresh_bench(seed)
     h.bring_up()
     r = Result("Supply voltage margining", True)
     rows = []
     for v in levels:
-        m.set("vcc", v)
-        m.run(1000)
+        bench.supply.set_voltage(v)
+        bench.wait_s(1.0)
         h.read_flags()
-        m.set("vcc", 3.3)
-        m.run(500)
-        m.set("vcc", v)
-        m.run(1000)
+        bench.supply.set_voltage(3.3)
+        bench.wait_s(0.5)
+        bench.supply.set_voltage(v)
+        bench.wait_s(1.0)
         lo = cmis.decode_lower(h.lower())   # this read clears bytes 8..11 (COR) ...
         fl = sum(1 << i for i, k in enumerate(cmis.FLAG_NAMES4) if lo["flags"]["vcc"][k])  # ... use its copy
-        rows.append({"vcc": v, "ddm": lo["vcc_v"], "flags": fl, "state": lo["module_state"]})
-        err = abs(lo["vcc_v"] - v) / v * 100
+        v_ref = bench.dmm.vdc()             # reference DMM at the module connector
+        rows.append({"vcc": v, "vcc_ref": v_ref, "ddm": lo["vcc_v"], "flags": fl, "state": lo["module_state"]})
+        err = abs(lo["vcc_v"] - v_ref) / v_ref * 100
         r.check(f"{v:.3f} V DDM accuracy", err <= LIM["vcc_acc_pct"], f"{lo['vcc_v']:.4f} V ({err:.2f} %)")
         exp = (0x1 if v > 3.63 else 0) | (0x2 if v < 2.97 else 0) | (0x4 if v > 3.465 else 0) | (
             0x8 if v < 3.135 else 0)
@@ -154,16 +226,18 @@ def vcc_margin(seed=1, levels=(2.95, 3.10, 3.15, 3.30, 3.45, 3.50, 3.70)) -> Res
 # ---------------------------------------------------------------- receiver
 
 def rx_sensitivity(seed=1, start=-12.0, stop=-3.0, step=0.5, dwell_ms=3000) -> Result:
-    m, h = fresh(seed)
+    m, h, bench = fresh_bench(seed)
     h.bring_up()
     r = Result("Receiver sensitivity (pre-FEC BER waterfall)", True)
     rows = []
     p = start
     while p <= stop + 1e-9:
-        m.set("rx_dbm", p)
-        m.run(dwell_ms)
+        bench.voa.set_output_dbm(p)        # calibrated source + VOA, all four lanes
+        bench.wait_s(dwell_ms / 1000)
         b0 = cmis.decode_pageB0(h.upper(0xB0))
         unc = b0["fec_uncorrectable"][0]
+        # "truth" is the twin's link model (no instrument equivalent; a lab
+        # would compare against a reference receiver or an external BERT)
         rows.append({"rx_dbm": p, "ber_meas": b0["prefec_ber"][0], "ber_true": m.get("ber.0"),
                      "snr_db": b0["snr_db"][0], "fec_uncorr": unc,
                      "fec_uncorr_dwell": unc - (rows[-1]["fec_uncorr"] if rows else 0),
@@ -433,6 +507,83 @@ def breakout(seed=31) -> Result:
     return r
 
 
+# ------------------------------------------------- host SerDes / diagnostics
+
+def host_si_sweep(seed=51, losses=(2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22), dwell_s=1.0) -> Result:
+    """Host channel loss sweep: module PRBS checker BER with adaptive vs. fixed 0 dB CTLE.
+    The switch ASIC (twin stimulus) transmits PRBS31Q on all 8 host lanes."""
+    m, h = fresh(seed)
+    h.bring_up()
+    m.set("host_prbs", cmis.PATTERN_CODES["PRBS31Q"])
+    r = Result("Host interface: channel loss sweep with PRBS31Q checker", True)
+    rows = []
+    for mode in ("adaptive", "fixed 0 dB"):
+        h.set_host_eq(adaptive=mode == "adaptive", fixed_db=0)
+        for loss in losses:
+            m.set("host_loss_db", loss)
+            m.run(300)
+            meas = h.prbs_measure("host", dwell_s)
+            lanes = h.host_lanes()
+            flags = h.read_flags()
+            bers = [b for b in meas["ber"] if b is not None]
+            rows.append({"mode": mode, "loss_db": loss, "ber": max(bers) if len(bers) == 8 else None,
+                         "lol_lanes": bin(meas["lol"]).count("1"), "snr_db": lanes[0]["snr_db"],
+                         "eq_db": lanes[0]["eq_db"], "adapt_fault": flags["tx_adapt_eq_fault"]})
+    h.set_host_eq(adaptive=True)
+    r.data["rows"] = rows
+    lim = LIM["host_loss_db"]
+    ad = [x for x in rows if x["mode"] == "adaptive"]
+    ok = [x for x in ad if x["loss_db"] <= lim]
+    r.check(f"adaptive CTLE: BER <= {LIM['host_ber']:.0e} on all lanes up to {lim} dB loss",
+            all(x["ber"] is not None and x["ber"] <= LIM["host_ber"] for x in ok),
+            ", ".join(f"{x['loss_db']} dB: {x['ber']:.1e}" if x["ber"] is not None else f"{x['loss_db']} dB: LOL"
+                      for x in ok[-3:]))
+    reach = max((x["loss_db"] for x in ad if x["ber"] is not None and x["ber"] <= 2.4e-4), default=0)
+    fixed = max((x["loss_db"] for x in rows if x["mode"] != "adaptive" and x["ber"] is not None
+                 and x["ber"] <= 2.4e-4), default=0)
+    r.data["reach_adaptive_db"], r.data["reach_fixed_db"] = reach, fixed
+    r.check("adaptive Eq extends reach over fixed 0 dB", reach > fixed, f"{reach} dB vs {fixed} dB at BER 2.4e-4")
+    # beyond the CTLE range: no lock; the fault flag latches once on the
+    # first loss that fails (edge-triggered latching, ADR 0004 / F-004)
+    beyond = [x for x in ad if x["ber"] is None]
+    r.check("channel beyond CTLE range: all lanes LOL, adaptive Eq fault latched",
+            bool(beyond) and all(x["lol_lanes"] == 8 for x in beyond) and beyond[0]["adapt_fault"] == 0xFF,
+            f"from {beyond[0]['loss_db']} dB" if beyond else "never lost lock")
+    return r
+
+
+def loopback_isolation(seed=52) -> Result:
+    """Cross-domain root cause with the module's own PRBS and loopbacks:
+    a degraded optical lane and a degraded host trace, told apart from the DSP."""
+    m, h = fresh(seed)
+    h.bring_up()
+    r = Result("Fault isolation with PRBS and loopbacks", True)
+    pat = cmis.PATTERN_CODES["PRBS31Q"]
+    m.set("far_prbs", pat)                 # far-end transceiver sends PRBS31Q
+    m.set("host_prbs", pat)                # switch ASIC sends PRBS31Q
+    m.set("rx_dbm.2", -9.0)                # dirty connector on media lane 3
+    m.set("host_loss_db.5", 21)            # bad host trace on host lane 6
+    m.run(500)
+    opt = h.prbs_measure("media", 2.0)
+    mlb = h.prbs_measure("media", 2.0, loopback="media-output")
+    host = h.prbs_measure("host", 2.0)
+    hlb = h.prbs_measure("host", 2.0, loopback="host-output")
+    r.data.update(media_optical=opt["ber"], media_loopback=mlb["ber"], host=host["ber"], host_loopback=hlb["ber"])
+    good = [opt["ber"][i] for i in (0, 1, 3)]
+    r.check("optical: lane 3 errors, lanes 1, 2, 4 clean",
+            opt["ber"][2] is not None and opt["ber"][2] > 1e-4 and all(b is not None and b < 1e-6 for b in good),
+            " / ".join("LOL" if b is None else f"{b:.1e}" for b in opt["ber"]))
+    r.check("media output loopback clean on all lanes: DSP is fine, fault is optical",
+            mlb["lol"] == 0 and all(b == 0 for b in mlb["ber"]))
+    r.check("host side: only host lane 6 out of lock", host["lol"] == 0x20, f"LOL mask 0x{host['lol']:02X}")
+    r.check("host output loopback clean: module SerDes is fine, fault is the host channel",
+            hlb["lol"] == 0 and all(b == 0 for b in hlb["ber"]))
+    f = h.read_flags()
+    r.check("Tx adaptive Eq fault flagged on host lane 6 only", f["tx_adapt_eq_fault"] == 0x20,
+            f"0x{f['tx_adapt_eq_fault']:02X}")
+    return r
+
+
 def run_all(quick: bool = False) -> list[Result]:
     res = [power_up_timing()]
     res.append(temp_sweep(temps=(0, 25, 70) if quick else (-5, 0, 15, 25, 40, 55, 70, 75),
@@ -443,4 +594,8 @@ def run_all(quick: bool = False) -> list[Result]:
     res += fw_update_suite()
     res.append(breakout())
     res.append(host_fuzz(n=1500 if quick else 4000))
+    res.append(host_si_sweep(losses=(4, 8, 12, 16, 20, 22) if quick else
+                             (2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22)))
+    res.append(loopback_isolation())
+    res.append(power_sequencing_scope())
     return res

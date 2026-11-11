@@ -158,11 +158,27 @@ struct omt_rx_lane {
 	uint16_t rssi_raw;
 	bool los;
 	bool lol;                     /* media-side CDR loss of lock        */
-	bool host_lol;                /* host-side CDR loss of lock         */
 	float snr_db;
 	float prefec_ber;
 	uint32_t fec_corr;
 	uint32_t fec_uncorr;
+};
+
+/* Host-side electrical lane (module Tx input, 400GAUI-8: 8 x 53.125 Gb/s) */
+struct omt_host_lane {
+	float snr_db;                 /* after the input CTLE               */
+	uint8_t eq_db;                /* CTLE peaking applied by the DSP    */
+	bool sig;                     /* signal detect                      */
+	bool lock;                    /* host-side CDR lock                 */
+	bool adapt_done;
+	bool adapt_fault;             /* adaptive Eq could not open the eye */
+};
+
+/* PRBS checker accumulation (Page 13h/14h diagnostics) */
+struct omt_chk {
+	uint64_t err;
+	uint64_t bits;                /* since enable or counter reset      */
+	bool lock;
 };
 
 struct omt_dp {
@@ -177,7 +193,7 @@ struct omt_dp {
 struct omt_cmis {
 	uint8_t lower[128];
 	uint8_t p00[128], p01[128], p02[128], p03[128];
-	uint8_t p10[128], p11[128], p9f[128], pb0[128], pb1[128];
+	uint8_t p10[128], p11[128], p13[128], p14[128], p9f[128], pb0[128], pb1[128];
 	uint8_t addr;                 /* I2C byte address pointer           */
 	bool cal_unlocked;
 	uint32_t dirty;
@@ -185,6 +201,7 @@ struct omt_cmis {
 	uint16_t ro_write;
 	uint8_t cond_module[4];       /* current (unlatched) conditions of bytes 8..11 */
 	uint8_t cond_lane[P11_FLAG_LAST - P11_FLAG_FIRST + 1];
+	uint8_t cond_diag[P14_FLAG_LAST - P14_FLAG_FIRST + 1];
 	uint32_t user_eeprom_dirty_ms;
 };
 
@@ -196,6 +213,8 @@ struct omt_cmis {
 #define DIRTY_CAL_CMD      0x0010u
 #define DIRTY_USER_EEPROM  0x0020u
 #define DIRTY_PASSWORD     0x0040u
+#define DIRTY_DIAG         0x0080u
+#define DIRTY_APPLY_IMMED  0x0100u
 
 struct omt_cdb {
 	uint16_t cmd;
@@ -232,6 +251,7 @@ struct omt_fw {
 	/* module state machine */
 	uint8_t mstate;
 	uint8_t pwrup_step;
+	uint32_t pwrup_t0;            /* rails switched on (step 0)         */
 	uint32_t mstate_t;
 	uint8_t fault_cause;
 	bool lowpwr_req;
@@ -243,6 +263,15 @@ struct omt_fw {
 	/* optics */
 	struct omt_tx_lane tx[OMT_N_MEDIA_LANES];
 	struct omt_rx_lane rx[OMT_N_MEDIA_LANES];
+	struct omt_host_lane host[OMT_N_HOST_LANES];
+
+	/* PRBS generators / checkers / loopbacks as applied to the DSP */
+	struct omt_chk hchk[OMT_N_HOST_LANES];
+	struct omt_chk mchk[OMT_N_MEDIA_LANES];
+	bool diag_applied;            /* Page 13h controls programmed       */
+	uint32_t diag_t;              /* when they were programmed          */
+	uint32_t diag_win_t;          /* start of the checker count window  */
+	uint8_t diag_shadow[P13_CTRL_LAST - P13_CTRL_FIRST + 1]; /* as programmed */
 
 	/* environment monitors (engineering units) */
 	float temp_c;
@@ -278,6 +307,11 @@ struct omt_fw {
 	bool boot_confirmed;
 	bool hung;                    /* image test hook: never kick WDT    */
 	uint32_t pending_reset_t;     /* deferred software reset, 0 = none  */
+
+	/* user EEPROM log position (nvm.c) */
+	uint32_t ueep_seq;
+	int16_t ueep_slot;            /* newest valid slot, -1 = none       */
+	uint8_t ueep_sec;
 
 	/* fault log */
 	uint32_t flog_seq;
@@ -332,6 +366,7 @@ void cmis_set_dp_state(struct omt_fw *fw, uint8_t host_lane, uint8_t st);
 void cmis_latch_module(struct omt_fw *fw, uint8_t byte_off, uint8_t cond);
 void cmis_latch_lane(struct omt_fw *fw, uint8_t flag_off, uint8_t cond);
 void cmis_update_intl(struct omt_fw *fw);
+void cmis_latch_diag(struct omt_fw *fw, uint8_t flag_off, uint8_t cond);
 uint8_t cmis_encode_power_class(uint32_t max_mw);
 
 /* monitor.c */
@@ -373,6 +408,19 @@ int dsp_set_mode(struct omt_fw *fw, uint8_t mode);
 int dsp_lane_enable(struct omt_fw *fw, uint8_t media_lane, bool on);
 bool dsp_lane_locked(struct omt_fw *fw, uint8_t media_lane, bool *host_lock);
 void dsp_task(struct omt_fw *fw);
+int dsp_host_eq(struct omt_fw *fw, uint8_t host_lane, bool adaptive, uint8_t fixed_db);
+void dsp_read_host(struct omt_fw *fw, uint8_t host_lane);
+int dsp_diag_program(struct omt_fw *fw);
+void dsp_diag_read(struct omt_fw *fw);
+int dsp_diag_lock(struct omt_fw *fw);
+void dsp_diag_discard(struct omt_fw *fw);
+
+/* serdes.c / diag.c */
+void serdes_apply_staged(struct omt_fw *fw, uint8_t lanes);
+void serdes_program(struct omt_fw *fw, uint8_t media_mask);
+void diag_init(struct omt_fw *fw);
+void diag_task(struct omt_fw *fw);
+uint16_t cmis_f16_encode(float v);
 
 /* nvm.c */
 uint32_t omt_crc32(uint32_t crc, const void *data, size_t len);

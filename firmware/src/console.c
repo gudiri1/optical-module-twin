@@ -84,7 +84,7 @@ static void exec(struct omt_fw *fw, char *line)
 		return;
 	}
 	if (!strcmp(argv[0], "help")) {
-		omt_printf(fw, "help ver state mon lanes dsp faults [n] log tasks tec cal\r\n"
+		omt_printf(fw, "help ver state mon lanes dsp serdes faults [n] log tasks tec cal\r\n"
 			       "mdio r <dev> <reg> | mdio w <dev> <reg> <val> | ld r <reg> | reset\r\n");
 	} else if (!strcmp(argv[0], "ver")) {
 		omt_printf(fw, "fw %u.%u build %u bank %c%s, cmis 5.2, resets %u (last cause %u)\r\n",
@@ -114,6 +114,27 @@ static void exec(struct omt_fw *fw, char *line)
 			omt_printf(fw, "L%d snr %.2f dB preFEC %.3e corr %lu uncorr %lu\r\n", l + 1,
 				   (double)fw->rx[l].snr_db, (double)fw->rx[l].prefec_ber,
 				   (unsigned long)fw->rx[l].fec_corr, (unsigned long)fw->rx[l].fec_uncorr);
+		}
+	} else if (!strcmp(argv[0], "serdes")) {
+		/* host-side input lanes and PRBS checkers, for bring-up without a host */
+		uint8_t hchk = fw->m.p13[P13_HOST_CHK_EN - 128], mchk = fw->m.p13[P13_MEDIA_CHK_EN - 128];
+
+		for (int h = 0; h < OMT_N_HOST_LANES; h++) {
+			const struct omt_host_lane *x = &fw->host[h];
+
+			omt_printf(fw, "H%d %s %s ctle %2u dB snr %5.2f dB%s\r\n", h + 1, x->sig ? "sig" : "LOS",
+				   x->lock ? "lock" : "LOL ", x->eq_db, (double)x->snr_db,
+				   x->adapt_fault ? " EQ-FAULT" : "");
+			if ((hchk >> h) & 1) {
+				omt_printf(fw, "   chk %s err %lu bits %.3e\r\n", fw->hchk[h].lock ? "lock" : "LOL",
+					   (unsigned long)fw->hchk[h].err, (double)fw->hchk[h].bits);
+			}
+		}
+		for (int m = 0; m < OMT_N_MEDIA_LANES; m++) {
+			if ((mchk >> m) & 1) {
+				omt_printf(fw, "M%d chk %s err %lu bits %.3e\r\n", m + 1, fw->mchk[m].lock ? "lock" : "LOL",
+					   (unsigned long)fw->mchk[m].err, (double)fw->mchk[m].bits);
+			}
 		}
 	} else if (!strcmp(argv[0], "faults")) {
 		cmd_faults(fw, argc > 1 ? atoi(argv[1]) : 10);

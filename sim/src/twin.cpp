@@ -9,6 +9,9 @@
 //   * RX photodiodes + TIA RSSI into a 16-bit ADC with part-to-part spread
 //   * PAM4 DSP: SNR from received OMA, BER = 3/8 erfc(sqrt(SNR/10)), Poisson
 //     error counts, RS(544,514) KP4 FEC codeword statistics, CDR/FFE lock
+//   * host-side SerDes (400GAUI-8, 8 x 26.5625 GBd PAM4): channel loss at
+//     Nyquist vs. input CTLE peaking (adaptive or fixed), host CDR lock
+//   * PRBS generators/checkers on host and media side, four loopbacks
 //   * NOR flash with erase/program semantics, watchdog, reset pins
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -29,6 +32,12 @@ extern "C" {
 namespace {
 
 constexpr double kLineBitsPerMs = 106.25e6;          // 53.125 GBd PAM4
+constexpr double kHostBitsPerMs = 53.125e6;          // 400GAUI-8 lane, 26.5625 GBd PAM4
+constexpr double kHostSnrCeilDb = 27.0;              // host SerDes electrical ceiling
+constexpr double kIsiDbPerDb = 1.2;                  // SNR loss per dB of residual ISI
+constexpr double kNoiseEnhDbPerDb = 0.25;            // CTLE noise enhancement
+constexpr double kHostLockSnrDb = 15.0;
+constexpr int kMaxCtleDb = 12;
 constexpr double kCodewordBits = 5440.0;             // RS(544,514), 10-bit symbols
 constexpr double kNoiseOmaMw = 0.0231;               // noise-equivalent OMA (see dsp_lab)
 constexpr double kSnrCeilingLin = 158.5;             // 22 dB implementation ceiling
@@ -61,15 +70,38 @@ struct Laser {
 
 struct DspLane {
 	uint16_t lctrl = 0;
-	bool media_lock = false, host_lock = false, ffe = false;
-	uint64_t cond_since = 0, host_since = 0;
+	bool media_lock = false, ffe = false;
+	uint64_t cond_since = 0;
 	double snr_db = 0, ber = 0.375;
 	uint64_t acc_err = 0, acc_bits = 0, acc_fc = 0, acc_fu = 0;
 	uint32_t snap_err = 0, snap_bits16 = 0;
 	uint16_t snap_fc = 0, snap_fu = 0;
 	double cached_ber = -1, p_corr = 0, p_unc = 0;
-	bool host_los = false;
 };
+
+// one host electrical lane (module Tx input) and its CDR
+struct HostLane {
+	uint16_t ctrl = 0x1;          // b0 adaptive, b7..4 fixed CTLE dB
+	double loss_db = 8.0;         // host channel loss at Nyquist (stimulus)
+	bool los = false;             // stimulus: no signal from the host
+	bool lock = false, adapt_done = false;
+	int eq_db = 0;
+	double adapted_for = -1;      // loss the CTLE adapted to
+	uint64_t since = 0, adapt_since = 0;
+	double snr_db = 0, ber = 0.375;
+};
+
+// PRBS checker counters
+struct Checker {
+	bool lock = false;
+	uint64_t acc_err = 0, acc_bits = 0;
+	uint32_t snap_err = 0, snap_bits16 = 0;
+};
+
+double pam4_ber(double snr_db)
+{
+	return std::min(0.375, 0.375 * std::erfc(std::sqrt(std::pow(10.0, snr_db / 10.0) / 10.0)));
+}
 
 }  // namespace
 
@@ -96,6 +128,7 @@ struct omt_sim {
 
 	// ---- pins ----
 	int lpmode = 1, resetl = 1;
+	bool powered = true;
 	int out[OMT_PIN_COUNT]{};
 
 	// ---- environment & thermal ----
@@ -104,6 +137,8 @@ struct omt_sim {
 	double tec_u = 0.0;
 	bool tec_open = false;
 	double power_w = 0;
+	// switched supply rails behind the enable pins (load switch + bulk C)
+	double rail_tx_v = 0, rail_dsp_v = 0;
 
 	// ---- per unit spread (manufacturing variation) ----
 	double temp_sensor_off, vcc_gain_err, thermistor_off;
@@ -126,6 +161,12 @@ struct omt_sim {
 	uint64_t dsp_start_t = 0;
 	uint16_t dsp_hb = 0, dsp_mode = 0;
 	DspLane dl[4];
+	HostLane hl[8];
+	uint16_t hgen = 0, hchk = 0, mgen = 0, mchk = 0, lb_m = 0, lb_ho = 0, lb_hi = 0;
+	uint16_t pat_h[8]{}, pat_m[4]{};
+	Checker hc[8], mc[4];
+	int host_prbs = -1;           // pattern the host ASIC transmits (-1: traffic)
+	int far_prbs = -1;            // pattern arriving on the fiber from far end
 	double mdio_fail_p = 0;
 
 	// ---- flash ----
@@ -258,11 +299,18 @@ struct omt_sim {
 	{
 		dsp_started = dsp_ready = false;
 		if (!dsp_hang_sticky) dsp_hang = false;
-		for (auto &d : dl) {
-			bool hl = d.host_los;
-			d = DspLane{};
-			d.host_los = hl;
+		for (auto &d : dl) d = DspLane{};
+		for (auto &h : hl) {  // keep the stimuli, lose the register state
+			HostLane k;
+			k.loss_db = h.loss_db;
+			k.los = h.los;
+			h = k;
 		}
+		hgen = hchk = mgen = mchk = lb_m = lb_ho = lb_hi = 0;
+		std::fill(std::begin(pat_h), std::end(pat_h), 0);
+		std::fill(std::begin(pat_m), std::end(pat_m), 0);
+		for (auto &c : hc) c = Checker{};
+		for (auto &c : mc) c = Checker{};
 	}
 
 	int mdio_rd(uint8_t dev, uint16_t reg, uint16_t *v)
@@ -281,8 +329,10 @@ struct omt_sim {
 		else if (reg == 0x0003) *v = dsp_hb;
 		else if (reg >= 0x0010 && reg < 0x0014) *v = dl[reg - 0x10].lctrl;
 		else if (reg >= 0x0020 && reg < 0x0024) {
-			const DspLane &d = dl[reg - 0x20];
-			*v = (uint16_t)((d.host_lock ? 1 : 0) | (d.media_lock ? 2 : 0) | (d.ffe ? 4 : 0));
+			int l = reg - 0x20;
+			const DspLane &d = dl[l];
+			bool hlk = hl[2 * l].lock && hl[2 * l + 1].lock;
+			*v = (uint16_t)((hlk ? 1 : 0) | (d.media_lock ? 2 : 0) | (d.ffe ? 4 : 0));
 		} else if (reg >= 0x0030 && reg < 0x0034) {
 			*v = (uint16_t)std::clamp(dl[reg - 0x30].snr_db * 100.0, 0.0, 65535.0);
 		} else if (reg >= 0x0040 && reg < 0x0050) {
@@ -296,6 +346,38 @@ struct omt_sim {
 		} else if (reg >= 0x0060 && reg < 0x0064) *v = dl[reg - 0x60].snap_fc;
 		else if (reg >= 0x0068 && reg < 0x006C) *v = dl[reg - 0x68].snap_fu;
 		else if (reg == 0x0070) *v = (uint16_t)(int16_t)std::lround((mod_c + 8.0) * 10.0);
+		else if (reg >= 0x0100 && reg < 0x0108) *v = hl[reg - 0x100].ctrl;
+		else if (reg >= 0x0110 && reg < 0x0118) {
+			const HostLane &h = hl[reg - 0x110];
+			bool sig = (dl[(reg - 0x110) / 2].lctrl & 1) && !h.los;
+			*v = (uint16_t)((sig ? 1 : 0) | (h.lock ? 2 : 0) | (h.adapt_done ? 4 : 0));
+		} else if (reg >= 0x0120 && reg < 0x0128) {
+			*v = (uint16_t)std::clamp(hl[reg - 0x120].snr_db * 100.0, 0.0, 65535.0);
+		} else if (reg >= 0x0130 && reg < 0x0138) *v = (uint16_t)hl[reg - 0x130].eq_db;
+		else if (reg == 0x0200) *v = hgen;
+		else if (reg == 0x0201) *v = hchk;
+		else if (reg == 0x0202) *v = mgen;
+		else if (reg == 0x0203) *v = mchk;
+		else if (reg == 0x0204) *v = lb_m;
+		else if (reg == 0x0205) *v = lb_ho;
+		else if (reg == 0x0206) *v = lb_hi;
+		else if (reg >= 0x0208 && reg < 0x0210) *v = pat_h[reg - 0x208];
+		else if (reg >= 0x0210 && reg < 0x0214) *v = pat_m[reg - 0x210];
+		else if (reg == 0x0218) {
+			uint16_t m = 0;
+			for (int i = 0; i < 8; i++) m |= (uint16_t)(hc[i].lock ? 1u << i : 0u);
+			for (int i = 0; i < 4; i++) m |= (uint16_t)(mc[i].lock ? 1u << (8 + i) : 0u);
+			*v = m;
+		} else if (reg >= 0x0220 && reg < 0x0250) {
+			int idx = (reg - 0x220) / 4;
+			const Checker &c = idx < 8 ? hc[idx] : mc[idx - 8];
+			switch ((reg - 0x220) % 4) {
+			case 0: *v = (uint16_t)(c.snap_err >> 16); break;
+			case 1: *v = (uint16_t)c.snap_err; break;
+			case 2: *v = (uint16_t)(c.snap_bits16 >> 16); break;
+			default: *v = (uint16_t)c.snap_bits16; break;
+			}
+		}
 		return 0;
 	}
 
@@ -308,7 +390,7 @@ struct omt_sim {
 			if (v & 0x8000) { dsp_reset_state(); return 0; }
 			uint16_t mode = (v >> 1) & 1;
 			if (dsp_ready && mode != dsp_mode)
-				for (auto &d : dl) { d.media_lock = d.host_lock = d.ffe = false; d.cond_since = d.host_since = t; }
+				for (auto &d : dl) { d.media_lock = d.ffe = false; d.cond_since = t; }
 			dsp_mode = mode;
 			if ((v & 1) && !dsp_started) { dsp_started = true; dsp_start_t = t; }
 		} else if (reg == 0x0002 && (v & 1)) {
@@ -319,13 +401,35 @@ struct omt_sim {
 				d.snap_fu = (uint16_t)std::min<uint64_t>(d.acc_fu, 0xFFFF);
 				d.acc_err = d.acc_bits = d.acc_fc = d.acc_fu = 0;
 			}
+
 		} else if (reg >= 0x0010 && reg < 0x0014) {
 			DspLane &d = dl[reg - 0x10];
 			if ((v & 2) && !(d.lctrl & 2)) d.cond_since = t;
-			if ((v & 1) && !(d.lctrl & 1)) d.host_since = t;
 			d.lctrl = v & 3;
 			if (!(v & 2)) d.media_lock = d.ffe = false;
-			if (!(v & 1)) d.host_lock = false;
+		} else if (reg >= 0x0100 && reg < 0x0108) {
+			HostLane &h = hl[reg - 0x100];
+			uint16_t nv = v & 0xF1;
+			if (nv != h.ctrl) { h.adapted_for = -1; h.lock = false; h.since = t; }
+			h.ctrl = nv;
+		} else if (reg == 0x0200) hgen = v & 0xFF;
+		else if (reg == 0x0201) hchk = v & 0xFF;
+		else if (reg == 0x0202) mgen = v & 0x0F;
+		else if (reg == 0x0203) mchk = v & 0x0F;
+		else if (reg == 0x0204) lb_m = v & 0xFF;
+		else if (reg == 0x0205) lb_ho = v & 0xFF;
+		else if (reg == 0x0206) lb_hi = v & 0xFF;
+		else if (reg >= 0x0208 && reg < 0x0210) pat_h[reg - 0x208] = v & 0xF;
+		else if (reg >= 0x0210 && reg < 0x0214) pat_m[reg - 0x210] = v & 0xF;
+		else if (reg == 0x021A) {  // checker snapshot (b0) / discard (b1)
+			for (Checker *c : {&hc[0], &hc[1], &hc[2], &hc[3], &hc[4], &hc[5], &hc[6], &hc[7],
+					   &mc[0], &mc[1], &mc[2], &mc[3]}) {
+				if (v & 1) {
+					c->snap_err = (uint32_t)std::min<uint64_t>(c->acc_err, 0xFFFFFFFFu);
+					c->snap_bits16 = (uint32_t)std::min<uint64_t>(c->acc_bits >> 16, 0xFFFFFFFFu);
+				}
+				if (v & 3) c->acc_err = c->acc_bits = 0;
+			}
 		}
 		return 0;
 	}
@@ -373,9 +477,6 @@ struct omt_sim {
 				if (d.ffe && !d.media_lock && t - d.cond_since >= 50) d.media_lock = true;
 			}
 
-			bool hcond = (d.lctrl & 1) && !d.host_los;
-			if (!hcond) { d.host_lock = false; d.host_since = t; }
-			else if (!d.host_lock && t - d.host_since >= 10) d.host_lock = true;
 
 			if (d.media_lock) {
 				d.acc_bits += (uint64_t)kLineBitsPerMs;
@@ -385,6 +486,71 @@ struct omt_sim {
 				d.acc_fu += poisson(cw * d.p_unc);
 				d.acc_fc += poisson(cw * d.p_corr);
 			}
+		}
+		step_host();
+		step_checkers();
+	}
+
+	// host lane: residual ISI after the CTLE costs SNR, peaking adds noise
+	void step_host()
+	{
+		for (int i = 0; i < 8; i++) {
+			HostLane &h = hl[i];
+			bool sig = (dl[i / 2].lctrl & 1) && !h.los;
+			bool adaptive = h.ctrl & 1;
+			if (!sig) {
+				h.lock = h.adapt_done = false;
+				h.adapted_for = -1;
+				h.since = h.adapt_since = t;
+				h.snr_db = 0;
+				h.ber = 0.375;
+				continue;
+			}
+			if (adaptive) {
+				if (std::fabs(h.loss_db - h.adapted_for) > 0.5) {  // (re)adapt
+					h.adapted_for = h.loss_db;
+					h.adapt_done = false;
+					h.adapt_since = t;
+				}
+				if (!h.adapt_done && t - h.adapt_since >= 25) {
+					h.adapt_done = true;
+					h.eq_db = std::clamp((int)std::lround(h.loss_db), 0, kMaxCtleDb);
+				}
+				if (!h.adapt_done) h.eq_db = 0;
+			} else {
+				h.adapt_done = false;
+				h.eq_db = std::min<int>((h.ctrl >> 4) & 0xF, kMaxCtleDb);
+			}
+			h.snr_db = kHostSnrCeilDb - kIsiDbPerDb * std::fabs(h.loss_db - h.eq_db) - kNoiseEnhDbPerDb * h.eq_db;
+			h.ber = pam4_ber(h.snr_db);
+			bool cond = h.snr_db >= kHostLockSnrDb && (!adaptive || h.adapt_done);
+			if (!cond) { h.lock = false; h.since = t; }
+			else if (!h.lock && t - h.since >= 10) h.lock = true;
+		}
+	}
+
+	void count(Checker &c, bool lock, double ber, double bits)
+	{
+		c.lock = lock;
+		if (!lock) return;
+		c.acc_bits += (uint64_t)bits;
+		c.acc_err += poisson(ber * bits);
+	}
+
+	// PRBS checkers. Output loopbacks turn the module's own generator back
+	// into its checker inside the DSP (no channel, no optics).
+	void step_checkers()
+	{
+		for (int i = 0; i < 8; i++) {
+			if (!(hchk & (1u << i))) { hc[i].lock = false; continue; }
+			if (lb_ho & (1u << i)) count(hc[i], hgen & (1u << i), 0.0, kHostBitsPerMs);
+			else count(hc[i], hl[i].lock && host_prbs == pat_h[i], hl[i].ber, kHostBitsPerMs);
+		}
+		for (int m = 0; m < 4; m++) {
+			if (!(mchk & (1u << m))) { mc[m].lock = false; continue; }
+			if (lb_m & (1u << m)) { count(mc[m], mgen & (1u << m), 0.0, kLineBitsPerMs); continue; }
+			int src = loopback ? ((mgen & (1u << m)) ? pat_m[m] : -1) : far_prbs;
+			count(mc[m], dl[m].media_lock && src == pat_m[m], dl[m].ber, kLineBitsPerMs);
 		}
 	}
 
@@ -452,6 +618,10 @@ struct omt_sim {
 		double itec = tec_current();
 		p += itec * itec * 1.2;
 		power_w = p;
+
+		// rails: first order, 0.4 ms (laser driver 3.3 V) and 1.5 ms (DSP core 0.75 V)
+		rail_tx_v += ((out[OMT_PIN_TX_PWR] ? 3.3 : 0.0) - rail_tx_v) * std::min(1.0, dt / 0.4e-3);
+		rail_dsp_v += ((out[OMT_PIN_DSP_PWR] ? 0.75 : 0.0) - rail_dsp_v) * std::min(1.0, dt / 1.5e-3);
 
 		// module thermal mass (tau 20 s, 0.6 K/W to case)
 		mod_c += (case_c + 0.6 * power_w - mod_c) * dt / 20.0;
@@ -586,6 +756,12 @@ struct omt_sim {
 			int l = name[pl] - '0';
 			return (l >= 0 && l < 4) ? l : -1;
 		};
+		auto lane8 = [&](const char *prefix) -> int {
+			size_t pl = std::strlen(prefix);
+			if (name.compare(0, pl, prefix) != 0 || name.size() != pl + 1) return -1;
+			int k = name[pl] - '0';
+			return (k >= 0 && k < 8) ? k : -1;
+		};
 		int l;
 		if (name == "case_temp") case_c = v;
 		else if (name == "module_temp_now") { case_c = v; mod_c = v; laser_c = v; }
@@ -594,7 +770,7 @@ struct omt_sim {
 		else if (name == "resetl") {
 			int nv = v != 0;
 			if (resetl && !nv) { reset_hold = true; power_outputs_off(); fw_running = false; }
-			if (!resetl && nv) { reset_hold = false; do_reset(OMT_RST_HOST_PIN); }
+			if (!resetl && nv && powered) { reset_hold = false; do_reset(OMT_RST_HOST_PIN); }
 			resetl = nv;
 		} else if (name == "loopback") loopback = v != 0;
 		else if (name == "loop_atten_db") loop_atten_db = v;
@@ -602,7 +778,11 @@ struct omt_sim {
 		else if ((l = lane("rx_dbm.")) >= 0) rx_ext_dbm[l] = v;
 		else if ((l = lane("aging.")) >= 0) las[l].aging = v;
 		else if ((l = lane("ld_fault.")) >= 0) las[l].drv_fault_inject = v != 0;
-		else if ((l = lane("host_los.")) >= 0) dl[l].host_los = v != 0;
+		else if ((l = lane8("host_los.")) >= 0) hl[l].los = v != 0;
+		else if ((l = lane8("host_loss_db.")) >= 0) hl[l].loss_db = v;
+		else if (name == "host_loss_db") for (auto &h : hl) h.loss_db = v;
+		else if (name == "host_prbs") host_prbs = (int)v;
+		else if (name == "far_prbs") far_prbs = (int)v;
 		else if (name == "tec_open") tec_open = v != 0;
 		else if (name == "dsp_hang") dsp_hang = v != 0;
 		else if (name == "dsp_hang_sticky") { dsp_hang_sticky = v != 0; dsp_hang = dsp_hang || dsp_hang_sticky; }
@@ -610,6 +790,11 @@ struct omt_sim {
 		else if (name == "fw_hang") fw_hang = v != 0;
 		else if (name == "trace") trace_on = v != 0;
 		else if (name == "power_cycle") { power_outputs_off(); do_reset(OMT_RST_POWER_ON); }
+		else if (name == "power") {  // supply off: MCU unpowered; on: power-on reset
+			bool on = v != 0;
+			if (!on && powered) { powered = false; reset_hold = true; power_outputs_off(); fw_running = false; }
+			if (on && !powered) { powered = true; reset_hold = !resetl; do_reset(OMT_RST_POWER_ON); }
+		}
 		else return -1;
 		return 0;
 	}
@@ -622,6 +807,12 @@ struct omt_sim {
 			int l = name[pl] - '0';
 			return (l >= 0 && l < 4) ? l : -1;
 		};
+		auto lane8 = [&](const char *prefix) -> int {
+			size_t pl = std::strlen(prefix);
+			if (name.compare(0, pl, prefix) != 0 || name.size() != pl + 1) return -1;
+			int k = name[pl] - '0';
+			return (k >= 0 && k < 8) ? k : -1;
+		};
 		int l;
 		if (name == "time_ms") return (double)t;
 		if (name == "case_temp") return case_c;
@@ -631,6 +822,16 @@ struct omt_sim {
 		if (name == "tec_current") return tec_current();
 		if (name == "power_w") return power_w;
 		if (name == "intl") return fw_running ? out[OMT_PIN_INTL] : 1;
+		if (name == "powered") return powered;
+		if (name == "rail_tx_v") return rail_tx_v;
+		if (name == "rail_dsp_v") return rail_dsp_v;
+		if (name == "pin.tx_pwr") return out[OMT_PIN_TX_PWR];
+		if (name == "pin.dsp_pwr") return out[OMT_PIN_DSP_PWR];
+		if (name == "pin.dsp_rstn") return out[OMT_PIN_DSP_RSTN];
+		if (name == "pin.tec_en") return out[OMT_PIN_TEC_EN];
+		if (name == "pin.intl") return fw_running ? out[OMT_PIN_INTL] : 1;
+		if (name == "pin.lpmode") return lpmode;
+		if (name == "pin.resetl") return resetl;
 		if (name == "resets") return resets;
 		if (name == "wdt_resets") return wdt_resets;
 		if (name == "flash_erases") return flash_erases;
@@ -647,7 +848,16 @@ struct omt_sim {
 		if ((l = lane("snr_db.")) >= 0) return dl[l].snr_db;
 		if ((l = lane("ber.")) >= 0) return dl[l].ber;
 		if ((l = lane("media_lock.")) >= 0) return dl[l].media_lock;
-		if ((l = lane("host_lock.")) >= 0) return dl[l].host_lock;
+		if ((l = lane8("host_lock.")) >= 0) return hl[l].lock;
+		if ((l = lane8("host_snr_db.")) >= 0) return hl[l].snr_db;
+		if ((l = lane8("host_ber.")) >= 0) return hl[l].ber;
+		if ((l = lane8("host_eq_db.")) >= 0) return hl[l].eq_db;
+		if ((l = lane8("host_loss_db.")) >= 0) return hl[l].loss_db;
+		if ((l = lane8("host_chk_lock.")) >= 0) return hc[l].lock;
+		if ((l = lane("media_chk_lock.")) >= 0) return mc[l].lock;
+		if (name == "lb_media") return lb_m;
+		if (name == "lb_host_out") return lb_ho;
+		if (name == "lb_host_in") return lb_hi;
 		return NAN;
 	}
 };
