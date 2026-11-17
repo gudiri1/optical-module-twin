@@ -156,6 +156,130 @@ def link_ber(snr_db, n_sym=60000, ffe=True, seed=1, phase0_ui=0.3, tau_ui=0.7, r
     return out
 
 
+# ------------------------------------------- host electrical channel (C2M)
+#
+# The host-to-module electrical interface: a lossy board channel, a TX FIR in
+# the sender and a CTLE in the receiver. This is the part of the link that the
+# CMIS host-side equalization controls act on, and the part that is tuned
+# during integration ("look at the SerDes, run an FFT over the data, adjust
+# the CTLE"). Model constants are first order, like the rest of this module.
+
+BAUD_HZ = 53.125e9                     # 100G per lane PAM4
+F_NYQ_HZ = BAUD_HZ / 2
+FS_HZ = BAUD_HZ * OS
+
+
+def insertion_loss_db(f_hz, il_nyq_db=16.0):
+    """Board loss: skin effect (~sqrt f) plus dielectric (~f), scaled to il_nyq_db at Nyquist."""
+    fg = np.abs(np.asarray(f_hz, dtype=float)) / 1e9
+    raw = 0.8 * np.sqrt(fg) + 0.4 * fg
+    raw_nyq = 0.8 * math.sqrt(F_NYQ_HZ / 1e9) + 0.4 * F_NYQ_HZ / 1e9
+    return raw * il_nyq_db / raw_nyq
+
+
+def channel_ir(il_nyq_db=16.0, n=1 << 14, span_ui=40):
+    """Causal (minimum-phase) impulse response with the loss above, cepstrum method."""
+    f = np.fft.fftfreq(n, 1 / FS_HZ)
+    mag = 10 ** (-insertion_loss_db(f, il_nyq_db) / 20)
+    c = np.fft.ifft(np.log(mag)).real
+    w = np.zeros(n)
+    w[0] = 1
+    w[1:n // 2] = 2
+    w[n // 2] = 1
+    h = np.fft.ifft(np.exp(np.fft.fft(c * w))).real
+    return h[: span_ui * OS]
+
+
+def ctle_response(peak_db, f_hz):
+    """CTLE modeled on the IEEE 802.3 reference form: one zero, two poles, DC gain -peak_db."""
+    a = 10 ** (-peak_db / 20)
+    s = 2j * np.pi * np.asarray(f_hz, dtype=float)
+    wz = wp1 = 2 * np.pi * BAUD_HZ / 2.5
+    wp2 = 2 * np.pi * BAUD_HZ
+    return (a + s / wz) / ((1 + s / wp1) * (1 + s / wp2))
+
+
+def ctle_apply(y, peak_db):
+    from scipy import signal  # local import: scipy only needed for the signal path
+    a = 10 ** (-peak_db / 20)
+    wz = wp1 = 2 * np.pi * BAUD_HZ / 2.5
+    wp2 = 2 * np.pi * BAUD_HZ
+    z, p, k = signal.bilinear_zpk([-a * wz], [-wp1, -wp2], wp1 * wp2 / wz, FS_HZ)
+    b, den = signal.zpk2tf(z, p, k)
+    return signal.lfilter(b, den, y)
+
+
+def tx_fir(sym, pre=0.0, post=0.0):
+    """3-tap TX FIR on the symbol stream (pre, main, post), main = 1 - |pre| - |post|."""
+    main = 1.0 - abs(pre) - abs(post)
+    out = main * sym
+    out[:-1] += pre * sym[1:]
+    out[1:] += post * sym[:-1]
+    return out
+
+
+def host_link(il_nyq_db=16.0, ctle_db=0.0, tx_pre=0.0, tx_post=0.0, noise_rel=0.05,
+              n_sym=20000, seed=1, return_wave=False):
+    """Send PAM4 through TX FIR -> channel -> noise -> CTLE; return effective SNR at the best phase."""
+    rng = np.random.default_rng(seed)
+    sym = rng.choice(LEVELS, n_sym)
+    drive = tx_fir(sym, tx_pre, tx_post)
+    x = np.repeat(drive, OS)
+    y = np.convolve(x, channel_ir(il_nyq_db))[: len(x)]
+    y = y + rng.normal(0, noise_rel * np.std(np.repeat(sym, OS)), len(y))
+    z = ctle_apply(y, ctle_db) if ctle_db else y
+    best = (-np.inf, 0)
+    for d in range(0, 60 * OS):
+        s = z[d::OS][: n_sym]
+        t = sym[: len(s)]
+        g = float(np.dot(s, t) / np.dot(t, t))
+        e = s - g * t
+        snr = float(np.var(g * t) / np.var(e))
+        if snr > best[0]:
+            best = (snr, d)
+    out = {"esnr_db": 10 * math.log10(best[0]), "delay": best[1]}
+    if return_wave:
+        out.update({"x": x, "y": y, "sym": sym})
+    return out
+
+
+def estimate_channel_fft(x, y, blind=False, nperseg=4096, seed=5):
+    """Channel magnitude from data with Welch-averaged FFTs.
+
+    reference: |S_xy| / S_xx (TX data known, e.g. a PRBS test pattern)
+    blind:     sqrt(S_yy / S_expected) with the spectrum of random PAM4 through the
+               nominal TX (receiver knows the signal statistics, not the data)
+    """
+    from scipy import signal
+    f, pyy = signal.welch(y, FS_HZ, nperseg=nperseg)
+    if blind:
+        rng = np.random.default_rng(seed)
+        model = np.repeat(rng.choice(LEVELS, len(y) // OS), OS)
+        _, pexp = signal.welch(model, FS_HZ, nperseg=nperseg)
+        return f, np.sqrt(pyy / pexp)
+    _, pxx = signal.welch(x, FS_HZ, nperseg=nperseg)
+    _, pxy = signal.csd(x, y, FS_HZ, nperseg=nperseg)
+    return f, np.abs(pxy) / pxx
+
+
+def loss_at_nyquist_db(f, h, f_ref=1e9):
+    i = int(np.argmin(np.abs(f - F_NYQ_HZ)))
+    j = int(np.argmin(np.abs(f - f_ref)))
+    return float(20 * math.log10(h[j] / h[i]))
+
+
+def ctle_from_fft(f, h, peaks=np.arange(0, 20.5, 0.5)):
+    """CTLE setting that makes channel x CTLE flattest up to Nyquist (start value for tuning)."""
+    band = (f > 1e9) & (f <= F_NYQ_HZ)
+    spread = [float(np.std(20 * np.log10(h[band] * np.abs(ctle_response(p, f[band]))))) for p in peaks]
+    return float(peaks[int(np.argmin(spread))])
+
+
+def ctle_sweep(il_nyq_db=16.0, peaks=range(0, 21, 2), **kw):
+    """Measured effective SNR per CTLE setting (what a tuning loop on the real SerDes does)."""
+    return {float(p): host_link(il_nyq_db, ctle_db=float(p), **kw)["esnr_db"] for p in peaks}
+
+
 # ------------------------------------------------------------------- FEC
 
 def kp4_cw_failure(pre_fec_ber):

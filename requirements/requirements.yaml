@@ -96,3 +96,12 @@
 - id: REQ-INT-001
   text: Module memory shall decode identically in an independent host implementation (Zephyr CMIS library, PR 123842) where both define the field.
   source: Interoperability
+- id: REQ-SIG-001
+  text: The host electrical channel model shall allow estimating the channel loss at Nyquist from link data by FFT, with and without knowledge of the transmitted data, to within 1 dB.
+  source: Design (integration practice)
+- id: REQ-SIG-002
+  text: The CTLE setting derived from the FFT estimate shall serve as start value for tuning; the tuned optimum (effective SNR sweep) shall lie within 4 dB of it.
+  source: Design (integration practice)
+- id: REQ-SIG-003
+  text: The TX FIR model shall reproduce the effect of host-side de-emphasis on effective SNR, including the penalty of a wrong sign.
+  source: Design / IEEE 802.3 C2M

@@ -1,6 +1,11 @@
 # Changelog
 
 ## Unreleased
+* dsplab: host electrical channel (C2M) with board loss model, TX FIR and a
+  CTLE modeled on the IEEE 802.3 reference form; channel loss estimated from
+  link data by FFT (with and without the transmitted data) as start value
+  for CTLE tuning, refined by an effective-SNR sweep. REQ-SIG-001..003,
+  `tests/integration/test_signal_path.py`. Adds scipy to the requirements.
 * Build and run natively on Windows (MinGW): the host `ctypes` binding
   discovers the platform-correct `libomt_sim` name, and the Windows DLL is
   statically linked (libgcc/libstdc++/winpthread) so it loads without the
